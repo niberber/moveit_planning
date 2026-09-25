@@ -1,0 +1,11 @@
+float64[] start_joint_angles
+float64 x
+float64 y
+float64 z
+float64 roll
+float64 pitch
+float64 yaw
+---
+moveit_msgs/RobotTrajectory trajectory
+bool success
+string msg
