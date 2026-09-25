@@ -49,11 +49,12 @@ ament_target_dependencies(ik_client
 )
 rosidl_target_interfaces(ik_client ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
-add_executable(moveit_planning src/moveit_planning.cpp)
+add_executable(moveit_planning src/moveit_planning.cpp src/feedback_pub.cpp)
 ament_target_dependencies(moveit_planning
   rclcpp
   moveit_core
   moveit_ros_planning_interface
+  sensor_msgs
 )
 
 target_include_directories(moveit_planning PRIVATE /usr/include)
