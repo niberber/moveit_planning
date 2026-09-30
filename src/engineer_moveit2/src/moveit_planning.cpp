@@ -26,6 +26,9 @@
 #define NUM_JOINTS 7
 uint8_t g_num_joints = NUM_JOINTS;
 
+// 标定模式：1=标定(跳过MoveIt)，0=正常规划。标定用法见 calib_loop()
+#define CALIB_MODE 0
+
 namespace protocal {
 enum Cmd : uint16_t {
     PLAN_REQ      = 0x01,
@@ -35,12 +38,12 @@ enum Cmd : uint16_t {
     PLAN_RECORD   = 0x05,
 };
 // ==================== 帧格式定义 ====================
-// STM32 -> PC: CMD_PLAN_REQ (0x01) + joints[7](28)
+// STM32 -> PC: CMD_PLAN_REQ (0x01) + pose[6](24)   xyz[3] + rpy[3](固定轴XYZ)
 // PC -> STM32: CMD_PLAN_RESP (0x02) + seq(1) + joints[7](28)
 #pragma pack(push, 1)
 struct PlanReq {
     uint16_t cmd;        // 0x01
-    float joints[NUM_JOINTS]; // 目标关节角度
+    float pose[6];       // 目标TCP位姿: xyz(3) + rpy(3), base_link系
 };
 
 struct PlanResp {
@@ -105,7 +108,7 @@ static uint16_t crc16(const uint8_t* data, size_t len){
 }
 
 static rclcpp::Node::SharedPtr g_node;
-static std::string g_serial_port = "/dev/ttyUSB0";
+static std::string g_serial_port = "/dev/ttyUSB2";
 static int g_serial_fd = -1;
 
 // 状态机状态
@@ -127,9 +130,9 @@ static int g_replan_attempts = 0;                     // 连续重规划失败�
 // PlanFeedback 缓冲区（无锁 atomic 供监视线程读）
 static std::vector<double> g_feedback_joints(g_num_joints, 0.0);
 static std::mutex g_feedback_mutex; // 保护反馈的互斥锁
-static const double g_joint_offset[NUM_JOINTS] = {0.0, -0.006, -0.008, -0.030, 0.004, 0.808, 0.001};
-// j9(roll)电机方向与URDF相反，反馈需取反
-static const double g_joint_sign[NUM_JOINTS]  = {1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 1.0};
+static const double g_joint_offset[NUM_JOINTS] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+// 标定结论：7轴方向与URDF一致
+static const double g_joint_sign[NUM_JOINTS]  = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
 static uint8_t g_send_seq = 0;  // 发送包序号
 
 // 执行期监视
@@ -253,9 +256,10 @@ static bool init_moveit() {
     // 2. 声明运动学参数
     // =====================================
     g_node->declare_parameter("robot_description", urdf_str);
-    g_node->declare_parameter("arm_group.kinematics_solver", "kdl_kinematics_plugin/KDLKinematicsPlugin");
+    g_node->declare_parameter("arm_group.kinematics_solver", "trac_ik_kinematics_plugin/TRAC_IKKinematicsPlugin");
     g_node->declare_parameter("arm_group.kinematics_solver_search_resolution", 0.005);
     g_node->declare_parameter("arm_group.kinematics_solver_timeout", 1.0);
+    g_node->declare_parameter("arm_group.solve_type", "Distance");
 
     // =====================================
     // 3. 创建机器人模型
@@ -282,11 +286,14 @@ static bool init_moveit() {
 
 }
 
-// 关节角 → TCP位姿 的FK转换函数，直接返回 Isometry3d 避免欧拉角多解
-static Eigen::Isometry3d joints_to_pose(const std::vector<double>& joints){
-    moveit::core::RobotState rs(g_robot_model);
-    rs.setJointGroupPositions(g_joint_group, joints);
-    return rs.getGlobalLinkTransform("link11");
+// TCP位姿(xyz + 固定轴XYZ的rpy) → Isometry3d
+static Eigen::Isometry3d pose_to_isometry(const float pose[6]){
+    Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+    T.translation() = Eigen::Vector3d(pose[0], pose[1], pose[2]);
+    T.linear() = (Eigen::AngleAxisd(pose[5], Eigen::Vector3d::UnitZ())
+                * Eigen::AngleAxisd(pose[4], Eigen::Vector3d::UnitY())
+                * Eigen::AngleAxisd(pose[3], Eigen::Vector3d::UnitX())).toRotationMatrix();
+    return T;
 }
 
 static std::vector<std::vector<float>> best_plan_(const Eigen::Isometry3d& target){
@@ -532,7 +539,7 @@ static std::vector<std::vector<float> > constrained_plan_(
 }
 // 监视线程：50HZ检查反馈偏差
 static void monitor_thread_func(){
-    const double diviation_threshold = 5.0 * M_PI / 180.0; // 角度偏差阈值5°
+    const double diviation_threshold = 1 * M_PI / 180.0; // 角度偏差阈值5°
     const int consecutive_fails = 3;          // 连续3次失败后认为偏离计划
     int fail_count = 0;
 
@@ -600,7 +607,7 @@ static void serial_thread_func() {
                         g_recv_req = req;       // 保存新计划
                         g_new_plan = true;      // 标记有新计划
                         g_state = State::PLANNING;
-                        RCLCPP_INFO(LOGGER, "Received PlanReq: joints = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", req.joints[0], req.joints[1], req.joints[2], req.joints[3], req.joints[4], req.joints[5], req.joints[6]);
+                        RCLCPP_INFO(LOGGER, "Received PlanReq: pose = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", req.pose[0], req.pose[1], req.pose[2], req.pose[3], req.pose[4], req.pose[5]);
                     } else {
                         RCLCPP_ERROR(LOGGER, "Failed to parse PlanReq");
                     }
@@ -609,22 +616,30 @@ static void serial_thread_func() {
                     protocal::PlanFeedback fb;
                     if(parse_feedback_frame(rx_buffer.data() + i, total, &fb)){
                         
-                        std::lock_guard<std::mutex> lock(g_feedback_mutex);
-
-                        for(int k = 0; k < g_num_joints; k++)g_feedback_joints[k] = g_joint_sign[k] * fb.joints[k] * M_PI / 180.0 - g_joint_offset[k];
-
+                        std::unique_lock<std::mutex> lock(g_feedback_mutex);
+                        float arm[7];
+                        for(int k = 0; k < g_num_joints; k++){
+                            g_feedback_joints[k] = fb.joints[k];
+                            arm[k] = (float)g_feedback_joints[k];
+                        }
+                        lock.unlock();  // 文件IO放在锁外，避免阻塞规划线程
+                        feedback_pub::save_feedback(fb.step_idx, arm);
                         g_exec_step = fb.step_idx;
-                        RCLCPP_INFO(LOGGER, "Received PlanFeedback: joints = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f] step=%d", g_feedback_joints[0], g_feedback_joints[1], g_feedback_joints[2], g_feedback_joints[3], g_feedback_joints[4], g_feedback_joints[5], g_feedback_joints[6], fb.step_idx);
-                    } else {
-                        RCLCPP_ERROR(LOGGER, "Failed to parse PlanFeedback");
                         
+#if !CALIB_MODE
+                        RCLCPP_INFO(LOGGER, "Received PlanFeedback: joints = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f] step=%d", g_feedback_joints[0], g_feedback_joints[1], g_feedback_joints[2], g_feedback_joints[3], g_feedback_joints[4], g_feedback_joints[5], g_feedback_joints[6], fb.step_idx);
+#endif
+                    } else {
+#if !CALIB_MODE
+                        RCLCPP_WARN_THROTTLE(LOGGER, *g_node->get_clock(), 2000, "Failed to parse PlanFeedback, frame skipped");
+#endif
                     }
                 }
                 else if(recv_cmd == protocal::Cmd::PLAN_RECORD){
                     float raw[7], arm[7];
                     memcpy(raw, rx_buffer.data() + i + 7, sizeof(raw));
-                    for(int i = 0; i < 7; i++){
-                        arm[i] = g_joint_sign[i] * raw[i] - g_joint_offset[i];
+                    for(int k = 0; k < 7; k++){
+                        arm[k] = g_joint_sign[k] * raw[k] - g_joint_offset[k];
                     }
                     feedback_pub::publish_feedback(arm);
                 }
@@ -639,7 +654,8 @@ static void serial_thread_func() {
 }
 
 // 主循环：状态机调度
-static void send_trajectory(const std::vector<std::vector<float> >& traj){
+// apply_mapping=false 时跳过 sign/offset 换算，直接把输入当作下位机 raw 角下发（标定用）
+static void send_trajectory(const std::vector<std::vector<float> >& traj, bool apply_mapping = true){
     for(size_t i = 0; i < traj.size(); i++){
         if(!g_running)break;
         std::vector<uint8_t> buf;
@@ -648,7 +664,7 @@ static void send_trajectory(const std::vector<std::vector<float> >& traj){
         buf.push_back(i & 0xFF);
         buf.push_back(i >> 8);
         for(size_t j = 0; j < traj[i].size(); j++){
-            float stm32_angle = g_joint_sign[j] * traj[i][j] + g_joint_offset[j];
+            float stm32_angle = apply_mapping ? (g_joint_sign[j] * traj[i][j] + g_joint_offset[j]) : traj[i][j];
             uint8_t* p = (uint8_t*)&stm32_angle;
             for(int k = 0; k < 4; k++)buf.push_back(p[k]);
 
@@ -679,11 +695,7 @@ static void planning_thread_func(){
             case State::PLANNING: {
                 g_new_plan = false;
 
-                std::vector<double> target_joints(g_num_joints);
-                for(int k = 0; k < g_num_joints; k++){
-                    target_joints[k] = g_joint_sign[k] * g_recv_req.joints[k] - g_joint_offset[k];
-                }
-                Eigen::Isometry3d target = joints_to_pose(target_joints);
+                Eigen::Isometry3d target = pose_to_isometry(g_recv_req.pose);
 
                 // 用四元数打印，避免 eulerAngles 的多解问题
                 Eigen::Quaterniond q_print(target.rotation());
@@ -738,11 +750,7 @@ static void planning_thread_func(){
                 g_replan_requested = false;
                 //从当前实际关节状态重新规划
                 RCLCPP_INFO(LOGGER, "Replanning from current state...");
-                std::vector<double> target_joints(g_num_joints);
-                for(int k = 0; k < g_num_joints; k++){
-                    target_joints[k] = g_joint_sign[k] * g_recv_req.joints[k] - g_joint_offset[k];
-                }
-                Eigen::Isometry3d target = joints_to_pose(target_joints);
+                Eigen::Isometry3d target = pose_to_isometry(g_recv_req.pose);
 
                 auto traj = best_plan_(target);
                 if(!traj.empty()){
@@ -768,6 +776,53 @@ static void planning_thread_func(){
     }
 }
 
+#if CALIB_MODE
+/**
+ * @brief 标定模式主循环（直接控制）
+ *
+ * 用法：
+ *   1. 固件进入控制器模式(左拨杆下 + 右拨杆上)，臂停在 init 位
+ *   2. 每次输入两个数：<轴号 0-6> <raw目标角 rad>  例: `0 0.4`
+ *      - 目标轴：输入值**直接作为下位机 raw 角下发**，不做 sign/offset 换算
+ *      - 其余轴：自动填充为**当前反馈值**，即保持当前位不动
+ *   3. 到位后打印当前 raw 反馈
+ *   4. Ctrl-D 退出
+ *
+ * 说明：固件是位置控制器，step2 决定"物理去哪"，打印的 raw 只是回读。
+ *       offset 看"发 ros=0 时臂是否停在约定零位"；sign 看"发 +raw 时臂转向"。
+ */
+static void calib_loop() {
+    RCLCPP_INFO(LOGGER, "==== CALIB MODE ====  输入: <轴号0-6> <raw目标rad>  例: 0 0.4   其余轴保持当前位；Ctrl-D退出");
+    while (g_running && rclcpp::ok()) {
+        printf("[CALIB] 输入 <轴号0-6> <raw目标rad> > ");
+        fflush(stdout);
+
+        int idx; double val;
+        if (scanf("%d %lf", &idx, &val) != 2) { g_running = false; return; } // EOF/非法输入即退出
+        if (idx < 0 || idx >= NUM_JOINTS) { printf("[CALIB] 轴号越界(应为0-6)\n"); continue; }
+
+        std::vector<std::vector<float>> traj(1, std::vector<float>(NUM_JOINTS));
+        {
+            std::lock_guard<std::mutex> lock(g_feedback_mutex);
+            for (int k = 0; k < NUM_JOINTS; k++) traj[0][k] = static_cast<float>(g_feedback_joints[k]); // 其余轴保持当前位
+        }
+        traj[0][idx] = static_cast<float>(val); // 目标轴直接作为 raw 下发
+
+        send_trajectory(traj, /*apply_mapping=*/false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // 等待到位
+
+        std::vector<double> raw;
+        {
+            std::lock_guard<std::mutex> lock(g_feedback_mutex);
+            raw = g_feedback_joints;
+        }
+        printf("[CALIB] 轴%d 目标raw=%.4f  当前raw = [", idx, val);
+        for (int k = 0; k < NUM_JOINTS; k++) printf("%.4f%s", raw[k], k < NUM_JOINTS - 1 ? ", " : "");
+        printf("]\n");
+    }
+}
+#endif
+
 int main(int argc, char** argv){
     if(argc > 1) g_serial_port = argv[1];
 
@@ -775,6 +830,18 @@ int main(int argc, char** argv){
     g_node = std::make_shared<rclcpp::Node>("moveit_planning");
     feedback_pub::init(g_node);
     if(!open_serial())return 1; // 打开串口
+
+#if CALIB_MODE
+    // 标定模式：跳过 MoveIt，仅保留串口线程 + 手动下发
+    RCLCPP_INFO(LOGGER, "Calibration mode: MoveIt skipped");
+    std::thread serial_thr(serial_thread_func);
+    calib_loop();
+    g_running = false;
+    close_serial();
+    serial_thr.join();
+    rclcpp::shutdown();
+    return 0;
+#else
     if(!init_moveit()){
         RCLCPP_FATAL(LOGGER, "MoveIt! init failed");
         return 1;
@@ -799,4 +866,5 @@ int main(int argc, char** argv){
 
     rclcpp::shutdown();
     return 0;
+#endif
 }
