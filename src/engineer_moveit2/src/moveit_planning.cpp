@@ -29,6 +29,13 @@ uint8_t g_num_joints = NUM_JOINTS;
 // 标定模式：1=标定(跳过MoveIt)，0=正常规划。标定用法见 calib_loop()
 #define CALIB_MODE 0
 
+// 反馈录制开关：1=每帧0x04写CSV，0=关闭(避免空闲高频反馈刷爆CSV)
+#define RECORD_FEEDBACK 0
+
+// 卡死监视：到轨迹终点距离在 STALL_TIMEOUT_MS 内累计减小不足 PROGRESS_EPS(rad) 即判定卡死并重规划
+#define STALL_TIMEOUT_MS 500
+#define PROGRESS_EPS 0.01
+
 namespace protocal {
 enum Cmd : uint16_t {
     PLAN_REQ      = 0x01,
@@ -139,6 +146,7 @@ static uint8_t g_send_seq = 0;  // 发送包序号
 static std::atomic<int> g_exec_step = 0;            // 当前执行到第几步
 static std::vector<std::vector<float>> g_exec_traj; // 正在执行轨迹（只读）
 static std::mutex g_exec_mutex;                     // 保护执行轨迹的互斥锁
+static int g_arrived_cnt = 0;                       // 连续满足到位阈值的帧数
 
 //moveit
 static moveit::core::RobotModelPtr g_robot_model;
@@ -315,6 +323,7 @@ static std::vector<std::vector<float>> best_plan_(const Eigen::Isometry3d& targe
     if(start_joints.empty() || start_joints.size() < g_joint_group->getVariableCount()){
         start_joints.assign(g_joint_group->getVariableCount(), 0.0);//如果没有接收到反馈，默认0.0
     }
+    RCLCPP_INFO(LOGGER, "Start = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", start_joints[0], start_joints[1], start_joints[2], start_joints[3], start_joints[4], start_joints[5], start_joints[6]);
     start_state.setJointGroupPositions(g_joint_group, start_joints);
     
     // 检查起始状态是否违反关节限制，若则调整为符合限制的值
@@ -537,44 +546,53 @@ static std::vector<std::vector<float> > constrained_plan_(
     RCLCPP_INFO(LOGGER, "Constrained plan: %d points", N);
     return result;
 }
-// 监视线程：50HZ检查反馈偏差
+// 监视线程：检测"卡死/无进展"（到轨迹终点的距离长期不缩小即触发重规划）
+// 只看"是否在靠近终点"，不比较中间轨迹点，因此对下位机滞后/不同步免疫
 static void monitor_thread_func(){
-    const double diviation_threshold = 1 * M_PI / 180.0; // 角度偏差阈值5°
-    const int consecutive_fails = 3;          // 连续3次失败后认为偏离计划
-    int fail_count = 0;
+    const double progress_eps = PROGRESS_EPS;                              // 认为有进展的最小距离减小量(rad)
+    const auto stall_timeout = std::chrono::milliseconds(STALL_TIMEOUT_MS); // 无进展超过此时长即判定卡死
+
+    State prev_state = State::IDLE;
+    double best_dist = 1e9;                                        // 历史最近"到终点距离"
+    auto last_progress = std::chrono::steady_clock::now();
 
     while(g_running){
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
-        if(g_state.load() != State::EXECUTING){
-            fail_count = 0;
+        State st = g_state.load();
+        if(st != State::EXECUTING){
+            prev_state = st;
             continue;
         }
-        
+        if(prev_state != State::EXECUTING){                        // 刚进入执行：重置进度基线
+            best_dist = 1e9;
+            last_progress = std::chrono::steady_clock::now();
+            prev_state = st;
+        }
+
         std::vector<double> actual;
         {
             std::lock_guard<std::mutex> lock(g_feedback_mutex);
             actual = g_feedback_joints;
         }
-        std::vector<float> excepted;
+        std::vector<float> last_pt;
         {
             std::lock_guard<std::mutex> lock(g_exec_mutex);
-            int step = g_exec_step.load();
-            if(step >= 0 && step < (int)g_exec_traj.size())excepted = g_exec_traj[step];
+            if(!g_exec_traj.empty())last_pt = g_exec_traj.back();
         }
-        if(actual.empty() || excepted.empty())continue;
-        double maxn = 0.0;
-        for(int i = 0; i < g_num_joints; i++)maxn = std::max(maxn, std::fabs(actual[i] - excepted[i]));
+        if(actual.empty() || last_pt.empty())continue;
 
-        if(maxn > diviation_threshold){
-            fail_count++;
-            if(fail_count >= consecutive_fails){
-                RCLCPP_WARN(LOGGER, "Deviation %.3f persists, request replan", maxn);
-                g_replan_requested = true;
-                g_state = State::REPLANNING;
-            }
-        } else {
-            fail_count = 0;
+        double dist = 0.0;
+        for(int i = 0; i < g_num_joints; i++)dist = std::max(dist, std::fabs(actual[i] - last_pt[i]));
+
+        auto now = std::chrono::steady_clock::now();
+        if(dist < best_dist - progress_eps){                       // 仍在靠近终点
+            best_dist = dist;
+            last_progress = now;
+        } else if(now - last_progress > stall_timeout){            // 长时间不再靠近 → 卡死
+            RCLCPP_WARN(LOGGER, "No progress (dist=%.3f, best=%.3f), request replan", dist, best_dist);
+            g_replan_requested = true;
+            g_state = State::REPLANNING;
         }
     }
 }
@@ -615,15 +633,15 @@ static void serial_thread_func() {
                 else if(recv_cmd == protocal::Cmd::PLAN_FEEDBACK){
                     protocal::PlanFeedback fb;
                     if(parse_feedback_frame(rx_buffer.data() + i, total, &fb)){
-                        
-                        std::unique_lock<std::mutex> lock(g_feedback_mutex);
+                        {
+                            std::lock_guard<std::mutex> lock(g_feedback_mutex);
+                            for(int k = 0; k < g_num_joints; k++)g_feedback_joints[k] = fb.joints[k];
+                        }   // 作用域结束自动解锁
+#if RECORD_FEEDBACK
                         float arm[7];
-                        for(int k = 0; k < g_num_joints; k++){
-                            g_feedback_joints[k] = fb.joints[k];
-                            arm[k] = (float)g_feedback_joints[k];
-                        }
-                        lock.unlock();  // 文件IO放在锁外，避免阻塞规划线程
-                        feedback_pub::save_feedback(fb.step_idx, arm);
+                        for(int k = 0; k < g_num_joints; k++)arm[k] = fb.joints[k];
+                        feedback_pub::save_feedback(fb.step_idx, arm);   // 文件IO在锁外
+#endif
                         g_exec_step = fb.step_idx;
                         
 #if !CALIB_MODE
@@ -681,6 +699,7 @@ static void start_execution(const std::vector<std::vector<float> >& traj){
         g_exec_traj = traj;
         g_exec_step = 0;
     }
+    g_arrived_cnt = 0;
     g_state = State::EXECUTING;
 }
 
@@ -694,6 +713,7 @@ static void planning_thread_func(){
             }
             case State::PLANNING: {
                 g_new_plan = false;
+                g_replan_attempts = 0;   // 新请求重置重规划预算
 
                 Eigen::Isometry3d target = pose_to_isometry(g_recv_req.pose);
 
@@ -724,7 +744,9 @@ static void planning_thread_func(){
                     RCLCPP_INFO(LOGGER, "Replan requested during execution");
                     g_state = State::REPLANNING;
                 } else {
-                    // 完成判定：反馈关节角与轨迹终点各轴足够接近
+                    // 完成判定：反馈关节角与轨迹终点各轴足够接近，且连续多帧稳定在阈值内
+                    const double arrive_eps = 0.1;   // 到位阈值(rad)
+                    const int arrive_frames = 3;     // 连续满足帧数(约150ms)
                     std::vector<double> actual;
                     {
                         std::lock_guard<std::mutex> lock(g_feedback_mutex);
@@ -735,10 +757,12 @@ static void planning_thread_func(){
                         std::lock_guard<std::mutex> lock(g_exec_mutex);
                         auto& last_pt = g_exec_traj.back();
                         for(int j = 0; j < g_num_joints; j++){
-                            if(std::fabs(actual[j] - last_pt[j]) > 0.5){ arrived = false; break; }
+                            if(std::fabs(actual[j] - last_pt[j]) > arrive_eps){ arrived = false; break; }
                         }
                     }
-                    if(arrived){
+                    g_arrived_cnt = arrived ? g_arrived_cnt + 1 : 0;
+                    if(g_arrived_cnt >= arrive_frames){
+                        g_arrived_cnt = 0;
                         g_state = State::IDLE;
                         RCLCPP_INFO(LOGGER, "Execution complete, back to IDLE");
                     }
@@ -748,27 +772,29 @@ static void planning_thread_func(){
             }
             case State::REPLANNING: {
                 g_replan_requested = false;
+                // 每次进入重规划都消耗一次预算，规划成功也不清零（否则不可达目标会无限循环）
+                g_replan_attempts++;
+                if(g_replan_attempts > 3){
+                    uint16_t fail = 0x03;
+                    send_frame((uint8_t*)&fail, 2);
+                    g_state = State::IDLE;
+                    g_replan_attempts = 0;
+                    RCLCPP_ERROR(LOGGER, "Replan failed after 3 attempts, stop");
+                    break;
+                }
                 //从当前实际关节状态重新规划
-                RCLCPP_INFO(LOGGER, "Replanning from current state...");
+                RCLCPP_INFO(LOGGER, "Replanning from current state... (%d/3)", g_replan_attempts);
                 Eigen::Isometry3d target = pose_to_isometry(g_recv_req.pose);
 
                 auto traj = best_plan_(target);
                 if(!traj.empty()){
                     send_trajectory(traj);
                     start_execution(traj);
-                    g_replan_attempts = 0;
                     RCLCPP_INFO(LOGGER, "Replan succeeded");
-                } else if(g_replan_attempts < 3){
+                } else {
                     // 重规划失败不直接停死，回到 EXECUTING，由监视线程再次触发重试
-                    g_replan_attempts++;
                     g_state = State::EXECUTING;
                     RCLCPP_WARN(LOGGER, "Replan failed (%d/3), back to EXECUTING and retry", g_replan_attempts);
-                } else {
-                    uint16_t fail = 0x03;
-                    send_frame((uint8_t*)&fail, 2);
-                    g_state = State::IDLE;
-                    g_replan_attempts = 0;
-                    RCLCPP_ERROR(LOGGER, "Replan failed after 3 attempts, stop");
                 }
                 break;
             }
