@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <vector>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include "feedback_pub.hpp"
@@ -36,6 +37,10 @@ uint8_t g_num_joints = NUM_JOINTS;
 // 笛卡尔直线规划参数
 #define CART_EEF_STEP 0.05       // 末端步长(m)
 #define CART_JOINT_JUMP 0.5      // 相邻点关节跳变阈值(rad)，超此判奇异跳支
+
+// 圆弧离散参数：每段转角(deg)，决定弦高误差 e = r*(1-cos(step/2))
+#define ARC_STEP_DEG 3.0
+#define ARC_MIN_SEGMENTS 6      // 最小段数，保证小角度也有足够执行时长
 
 // 固件物理/动态限位(rad)：URDF 未覆盖或更宽，越限会被下位机夹住 → 关节≠下发 → 末端姿态漂移
 static const double deg2rad = 3.14159265358979323846 / 180.0;
@@ -56,6 +61,7 @@ enum Cmd : uint16_t {
     PLAN_FEEDBACK = 0x04,
     PLAN_RECORD   = 0x05,
     PLAN_REQ3     = 0x06,
+    PLAN_REQ_ARC  = 0x07,   // 绕固定轴旋转固定角度
 };
 // ==================== 帧格式定义 ====================
 // STM32 -> PC: CMD_PLAN_REQ (0x01) + pose[6](24)   xyz[3] + rpy[3](固定轴XYZ)
@@ -81,6 +87,13 @@ struct PlanFeedback {
 struct PlanReq3{
     uint16_t cmd;        // 0x06
     float delta[6];      // 基座系相对当前末端位姿的变换: [dx,dy,dz, drx,dry,drz]
+};
+
+struct PlanReqArc{
+    uint16_t cmd;          // 0x07
+    float axis_point[3];   // 轴上任意一点, base_link系 (m)
+    float axis_dir[3];     // 旋转轴方向, base_link系, 不要求已归一化
+    float theta;           // 带符号转角(rad), 右手定则, |theta| <= PI
 };
 #pragma pack(pop)
 }
@@ -133,7 +146,7 @@ static uint16_t crc16(const uint8_t* data, size_t len){
 }
 
 static rclcpp::Node::SharedPtr g_node;
-static std::string g_serial_port = "/dev/ttyUSB0";
+static std::string g_serial_port = "/dev/ttyUSB1";
 static int g_serial_fd = -1;
 
 // 状态机状态
@@ -141,6 +154,7 @@ enum class State{
     IDLE,
     PLANNING,
     PLANNING3,
+    PLANNING_ARC,
     EXECUTING
 };
 static std::atomic<State> g_state = State::IDLE; // 状态机状态
@@ -149,6 +163,8 @@ static std::atomic<bool> g_running = true;       // 是否在运行中
 // 请求/反馈
 static protocal::PlanReq g_recv_req;  // 接收的规划请求
 static Eigen::Isometry3d g_cart_goal; // 0x06 解析出的绝对目标位姿
+static protocal::PlanReqArc g_arc_req; // 0x07 圆弧请求
+static std::mutex g_arc_mutex;         // 保护 g_arc_req（串口线程写，规划线程读）
 static std::atomic<int> g_exec_fail_reason{0};  // 执行期失败原因：0=无 1=无进展卡死（监视线程写，规划线程统一处理）
 
 // PlanFeedback 缓冲区（无锁 atomic 供监视线程读）
@@ -177,7 +193,7 @@ static std::shared_ptr<planning_pipeline::PlanningPipeline> g_pipeline;
 static bool open_serial() {
     g_serial_fd = open(g_serial_port.c_str(), O_RDWR | O_NOCTTY);
     if (g_serial_fd < 0) {
-        RCLCPP_ERROR(LOGGER, "Failed to open %s", g_serial_port.c_str());
+        RCLCPP_ERROR(LOGGER, "串口打开失败: %s", g_serial_port.c_str());
         return false;
     }
 
@@ -199,7 +215,7 @@ static bool open_serial() {
     tty.c_cc[VTIME] = 1;      // 0.1秒超时
 
     tcsetattr(g_serial_fd, TCSANOW, &tty);
-    RCLCPP_INFO(LOGGER, "Serial opened: %s @ 921600", g_serial_port.c_str());
+    RCLCPP_INFO(LOGGER, "串口已打开: %s @ 921600", g_serial_port.c_str());
     return true;
 }
 
@@ -207,7 +223,7 @@ static void close_serial() {
     if (g_serial_fd >= 0) {
         close(g_serial_fd);
         g_serial_fd = -1;
-        RCLCPP_INFO(LOGGER, "Serial closed");
+        RCLCPP_INFO(LOGGER, "串口已关闭");
     }
 }
 
@@ -229,7 +245,7 @@ static void send_frame(const uint8_t* data, size_t len) {
         size_t n = write(g_serial_fd, frame + sent, total - sent);
         if(n <= 0){
             if(errno == EINTR) continue;
-            RCLCPP_ERROR(LOGGER, "Serial write failed: %s", strerror(errno));
+            RCLCPP_ERROR(LOGGER, "串口写入失败: %s", strerror(errno));
             return;
         }
         sent += n;
@@ -249,7 +265,7 @@ static bool parse_frame(const uint8_t* data, size_t len, protocal::PlanReq* out_
     uint16_t recv_crc = (uint16_t)data[total - 2] | (data[total - 1] << 8);
     uint16_t calc_crc = crc16(data, total - 2);
     if(recv_crc != calc_crc){
-        RCLCPP_ERROR(LOGGER, "CRC check failed: %d != %d", recv_crc, calc_crc);
+        RCLCPP_ERROR(LOGGER, "CRC 校验失败: %d != %d", recv_crc, calc_crc);
         return false;
     }
     return true;
@@ -267,7 +283,26 @@ static bool parse_plan3_frame(const uint8_t* data, size_t len, protocal::PlanReq
     uint16_t recv_crc = (uint16_t)data[total - 2] | (data[total - 1] << 8);
     uint16_t calc_crc = crc16(data, total - 2);
     if(recv_crc != calc_crc){
-        RCLCPP_ERROR(LOGGER, "CRC check failed: %d != %d", recv_crc, calc_crc);
+        RCLCPP_ERROR(LOGGER, "CRC 校验失败: %d != %d", recv_crc, calc_crc);
+        return false;
+    }
+    return true;
+}
+
+static bool parse_arc_frame(const uint8_t* data, size_t len, protocal::PlanReqArc* out_req){
+    //总长度 = 帧头(2) + seq(1) + 长度字段(2) + cmd(2) + 数据区 + CRC(2)
+    if(len < 8)return false;
+
+    uint16_t data_len = data[3] | (data[4] << 8);
+    size_t total = 5 + 2 + data_len + 2;
+    if(len < total)return false;
+
+    memcpy(out_req, data + 5, sizeof(protocal::PlanReqArc));
+
+    uint16_t recv_crc = (uint16_t)data[total - 2] | (data[total - 1] << 8);
+    uint16_t calc_crc = crc16(data, total - 2);
+    if(recv_crc != calc_crc){
+        RCLCPP_ERROR(LOGGER, "CRC 校验失败: %d != %d", recv_crc, calc_crc);
         return false;
     }
     return true;
@@ -323,7 +358,7 @@ static bool init_moveit() {
     // 创建规划管道
     g_node->declare_parameter("planning_pipeline.planning_plugin", rclcpp::ParameterValue("ompl_interface/OMPLPlanner"));
     g_pipeline = std::make_shared<planning_pipeline::PlanningPipeline>(g_robot_model, g_node, "planning_pipeline");
-    RCLCPP_INFO(LOGGER, "MoveIt initialized: %d joints", g_joint_group->getVariableCount());
+    RCLCPP_INFO(LOGGER, "MoveIt 初始化完成: %d 个关节", g_joint_group->getVariableCount());
     g_num_joints = g_joint_group->getVariableCount();
     return true;
 
@@ -351,23 +386,60 @@ static Eigen::Isometry3d current_tcp_pose(){
     st.update();
     return st.getGlobalLinkTransform(g_joint_group->getLinkModel("link11"));
 }
+// 由当前反馈关节角 FK 出末端位姿，按 base_link 固定轴 XYZ 打印 xyz 与 rpy(度)
+// 旋转矩阵约定与 pose_to_isometry 一致：R = Rz(yaw) * Ry(pitch) * Rx(roll)
+static void print_tcp_pose(){
+    if(!g_robot_model)return;
+    const Eigen::Isometry3d T = current_tcp_pose();
+    const Eigen::Matrix3d R = T.linear();
+    const double pitch = std::asin(std::max(-1.0, std::min(1.0, -R(2, 0)))) * deg2rad;
+    const double roll  = std::atan2(R(2, 1), R(2, 2)) * deg2rad;
+    const double yaw   = std::atan2(R(1, 0), R(0, 0)) * deg2rad;
+    RCLCPP_INFO(LOGGER, "TCP 位姿: xyz=(%.4f, %.4f, %.4f) m, rpy=(%.2f, %.2f, %.2f) rad",
+        T.translation().x(), T.translation().y(), T.translation().z(),
+        roll * rad2deg, pitch * rad2deg, yaw * rad2deg);
+}
 static bool firmware_limit_check(const double q[NUM_JOINTS]){
     static const char* joint_name[NUM_JOINTS] = {"yaw", "p1", "p2", "p3", "roll", "ep", "er"};
     for(int k = 0; k < NUM_JOINTS; k++){
         if(q[k] < firmware_min[k] || q[k] > firmware_max[k]){
-            RCLCPP_ERROR(LOGGER, "Joint %s limit violated: %.3f < %.3f <= %.3f", joint_name[k], firmware_min[k] * rad2deg, q[k] * rad2deg, firmware_max[k] * rad2deg);
+            RCLCPP_ERROR(LOGGER, "关节 %s 超出限位: %.3f < %.3f <= %.3f", joint_name[k], firmware_min[k] * rad2deg, q[k] * rad2deg, firmware_max[k] * rad2deg);
             return false;
         }
     }
     // if(q[2] - q[1] > firmware_p2p1_max){
-    //     RCLCPP_WARN(LOGGER, "firmware limit reject: p2-p1=%.1f deg > %.1f", (q[2] - q[1]) * rad2deg, firmware_p2p1_max * rad2deg);
+    //     RCLCPP_WARN(LOGGER, "固件限位拒绝: p2-p1=%.1f 度 > %.1f", (q[2] - q[1]) * rad2deg, firmware_p2p1_max * rad2deg);
     //     return false;
     // }
     // if(q[3] < -(q[1] + q[2])){
-    //     RCLCPP_WARN(LOGGER, "firmware limit reject: p3 = %.1f deg < -(p1+p2)=%.1f", q[3] * rad2deg, -(q[1] + q[2]) * rad2deg);
+    //     RCLCPP_WARN(LOGGER, "固件限位拒绝: p3 = %.1f 度 < -(p1+p2)=%.1f", q[3] * rad2deg, -(q[1] + q[2]) * rad2deg);
     //     return false;
     // }
     return true;
+}
+// 按每段 ARC_STEP_DEG 把转角切成 N 段，保证弦高误差并给足执行时长
+static int arc_segments(double theta){
+    int n = (int)std::ceil(std::fabs(theta) * rad2deg / ARC_STEP_DEG);
+    return std::max(n, ARC_MIN_SEGMENTS);
+}
+// 生成绕固定轴旋转的 waypoint：axis_point 为轴上任意一点，axis_dir 为单位轴，theta 为带符号转角
+static std::vector<Eigen::Isometry3d> arc_waypoints_(const Eigen::Vector3d& axis_point, const Eigen::Vector3d& axis_dir, double theta, const Eigen::Isometry3d& start, int N){
+    std::vector<Eigen::Isometry3d> waypoints;
+    if(N < 1 || theta == 0.0)return waypoints;
+
+    const Eigen::Vector3d n = axis_dir.normalized();                    // 旋转轴
+    const Eigen::Vector3d st = start.translation();                      // 起始点
+    const Eigen::Vector3d center = axis_point + (st - axis_point).dot(n) * n; // 旋转中心
+
+    waypoints.push_back(start);
+    for(int i = 1; i <= N; i++){
+        Eigen::AngleAxisd dR(theta * i / N, n);
+        Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+        T.translation() = center + dR * (st - center);
+        T.linear() = dR.toRotationMatrix() * start.linear();
+        waypoints.push_back(T);
+    }
+    return waypoints;
 }
 static std::vector<std::vector<float>> best_plan_(const Eigen::Isometry3d& target){
     const char* planners[] = {
@@ -391,7 +463,7 @@ static std::vector<std::vector<float>> best_plan_(const Eigen::Isometry3d& targe
     if(start_joints.empty() || start_joints.size() < g_joint_group->getVariableCount()){
         start_joints.assign(g_joint_group->getVariableCount(), 0.0);//如果没有接收到反馈，默认0.0
     }
-    RCLCPP_INFO(LOGGER, "Start = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", start_joints[0], start_joints[1], start_joints[2], start_joints[3], start_joints[4], start_joints[5], start_joints[6]);
+    RCLCPP_INFO(LOGGER, "起点关节角 = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", start_joints[0], start_joints[1], start_joints[2], start_joints[3], start_joints[4], start_joints[5], start_joints[6]);
     start_state.setJointGroupPositions(g_joint_group, start_joints);
 
     // 检查起始状态是否违反关节限制，若则调整为符合限制的值
@@ -432,19 +504,19 @@ static std::vector<std::vector<float>> best_plan_(const Eigen::Isometry3d& targe
 
     // 1.3 检查IK解是否有效
     if (!found) {
-        RCLCPP_ERROR(LOGGER, "IK failed (no valid solution within bounds) for target (%.3f, %.3f, %.3f)",
+        RCLCPP_ERROR(LOGGER, "IK 失败(限位内无有效解), 目标 (%.3f, %.3f, %.3f)",
             target.translation().x(), target.translation().y(), target.translation().z());
         return {};
     }
 
     // 1.4 检查IK解是否违反固件限制
     if(!firmware_limit_check(solution.data())){
-        RCLCPP_ERROR(LOGGER, "IK solution violates firmware limits for target (%.3f, %.3f, %.3f)",
+        RCLCPP_ERROR(LOGGER, "IK 解超出固件限位, 目标 (%.3f, %.3f, %.3f)",
             target.translation().x(), target.translation().y(), target.translation().z());
         return {};
     }
 
-    RCLCPP_INFO(LOGGER, "IK solved: joints = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+    RCLCPP_INFO(LOGGER, "IK 求解完成: 关节角 = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
         solution[0], solution[1], solution[2], solution[3], solution[4], solution[5], solution[6]);
 
     // 1.5 用IK结果创建目标RobotState（关节空间）
@@ -465,16 +537,16 @@ static std::vector<std::vector<float>> best_plan_(const Eigen::Isometry3d& targe
             st.setJointGroupPositions(g_joint_group, start_joints);
             collision_detection::CollisionResult cres;
             cscene->checkCollision(creq, cres, st);
-            RCLCPP_INFO(LOGGER, "Start collision: %d contacts, collision=%d", (int)cres.contacts.size(), (int)cres.collision);
+            RCLCPP_INFO(LOGGER, "起点碰撞: %d 个接触点, 碰撞=%d", (int)cres.contacts.size(), (int)cres.collision);
             for(auto& c : cres.contacts)
-                RCLCPP_INFO(LOGGER, "  %s <-> %s", c.first.first.c_str(), c.first.second.c_str());
+                RCLCPP_INFO(LOGGER, "  碰撞对: %s <-> %s", c.first.first.c_str(), c.first.second.c_str());
         }
         {
             collision_detection::CollisionResult cres;
             cscene->checkCollision(creq, cres, goal_state);
-            RCLCPP_INFO(LOGGER, "Goal collision: %d contacts, collision=%d", (int)cres.contacts.size(), (int)cres.collision);
+            RCLCPP_INFO(LOGGER, "目标碰撞: %d 个接触点, 碰撞=%d", (int)cres.contacts.size(), (int)cres.collision);
             for(auto& c : cres.contacts)
-                RCLCPP_INFO(LOGGER, "  %s <-> %s", c.first.first.c_str(), c.first.second.c_str());
+                RCLCPP_INFO(LOGGER, "  碰撞对: %s <-> %s", c.first.first.c_str(), c.first.second.c_str());
         }
     }
 
@@ -495,7 +567,7 @@ static std::vector<std::vector<float>> best_plan_(const Eigen::Isometry3d& targe
     planning_interface::MotionPlanResponse best_res;
     g_pipeline->generatePlan(scene, r, best_res);
     if(best_res.error_code_.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS){
-        RCLCPP_ERROR(LOGGER, "RRTConnect failed");
+        RCLCPP_ERROR(LOGGER, "RRTConnect 规划失败");
         return {};
     }
 
@@ -505,7 +577,7 @@ static std::vector<std::vector<float>> best_plan_(const Eigen::Isometry3d& targe
     auto& pts = traj_msg.joint_trajectory.points;
 
     if(pts.empty()){
-        RCLCPP_ERROR(LOGGER, "Planning returned empty trajectory");
+        RCLCPP_ERROR(LOGGER, "规划返回空轨迹");
         return {};
     }
     for(size_t i = 0; i < pts.size(); i++){
@@ -520,7 +592,7 @@ static std::vector<std::vector<float>> best_plan_(const Eigen::Isometry3d& targe
             best_trajectory.push_back(std::vector<float>(pts[i].positions.begin(), pts[i].positions.end()));
         }
     }
-    RCLCPP_INFO(LOGGER, "Planning succeeded: %zu trajectory points", best_trajectory.size());
+    RCLCPP_INFO(LOGGER, "规划成功: %zu 个轨迹点", best_trajectory.size());
     return best_trajectory;
 }
 
@@ -528,7 +600,7 @@ static std::vector<std::vector<float>> best_plan_(const Eigen::Isometry3d& targe
 // 起点由当前关节反馈 FK 得到，直线插值到绝对目标位姿 target，全程回避碰撞
 static std::vector<std::vector<float> > cartesian_plan_(const std::vector<Eigen::Isometry3d>& waypoints){
     if(waypoints.size() < 2){
-        RCLCPP_ERROR(LOGGER, "waypoints < 2");
+        RCLCPP_ERROR(LOGGER, "路径点数量不足 2");
         return {};
     }
     std::vector<double> cur_joints;
@@ -549,7 +621,7 @@ static std::vector<std::vector<float> > cartesian_plan_(const std::vector<Eigen:
 
     //调试日志：发了几段，每段去哪
     for(size_t k = 0; k < waypoints.size(); k++){
-        RCLCPP_INFO(LOGGER, "waypoint[%zu] = (%.3f, %.3f, %.3f)",
+        RCLCPP_INFO(LOGGER, "路径点[%zu] = (%.3f, %.3f, %.3f)",
             k, waypoints[k].translation().x(), waypoints[k].translation().y(), waypoints[k].translation().z());
     }
     int firmware_limits = 0, collision = 0;
@@ -585,7 +657,7 @@ static std::vector<std::vector<float> > cartesian_plan_(const std::vector<Eigen:
         moveit::core::JumpThreshold(CART_JOINT_JUMP, 0.0),
         valid);// 生成轨迹
         if((double(frac) < 1.0)){
-            RCLCPP_ERROR(LOGGER, "Cartesian seg %zu incomplete: %.1f%% (firmware=%d, collision=%d)", s, double(frac) * 100.0, firmware_limits, collision);
+            RCLCPP_ERROR(LOGGER, "笛卡尔段 %zu 未完成: %.1f%% (固件限位=%d, 碰撞=%d)", s, double(frac) * 100.0, firmware_limits, collision);
             return {};
         }
         //拼接
@@ -597,8 +669,52 @@ static std::vector<std::vector<float> > cartesian_plan_(const std::vector<Eigen:
         st->copyJointGroupPositions(g_joint_group, q);
         result.emplace_back(q.begin(), q.end());
     }
-    RCLCPP_INFO(LOGGER, "Cartesian plan: %zu segment -> %zu points", waypoints.size() - 1, result.size());
+    RCLCPP_INFO(LOGGER, "笛卡尔规划: %zu 段 -> %zu 点", waypoints.size() - 1, result.size());
     return result;
+}
+// 用 FK 校验规划结果：首/末点是否贴合期望 waypoint，相邻点是否发生跳支。
+static void check_traj(const std::vector<std::vector<float> >& traj,
+                       const std::vector<Eigen::Isometry3d>& waypoints,
+                       const char* tag)
+{
+    if(traj.empty() || waypoints.empty() || !g_robot_model)return;
+    const moveit::core::LinkModel* tip = g_joint_group->getLinkModel("link11");
+
+    auto fk = [&](const std::vector<float>& q){
+        moveit::core::RobotState st(g_robot_model);
+        st.setJointGroupPositions(g_joint_group, std::vector<double>(q.begin(), q.end()));
+        st.update();
+        return st.getGlobalLinkTransform(tip);
+    };
+
+    const Eigen::Isometry3d T0 = fk(traj.front());
+    const Eigen::Isometry3d T1 = fk(traj.back());
+    const Eigen::Isometry3d& E1 = waypoints.back();
+    const double pos_err = (T1.translation() - E1.translation()).norm() * 1000.0;              // mm
+    const double rot_err = Eigen::AngleAxisd(T1.linear().transpose() * E1.linear()).angle() * rad2deg;
+
+    RCLCPP_INFO(LOGGER, "[%s] 规划自检: %zu 点, 首点FK=(%.4f,%.4f,%.4f)",
+        tag, traj.size(), T0.translation().x(), T0.translation().y(), T0.translation().z());
+    RCLCPP_INFO(LOGGER, "[%s] 末点FK=(%.4f,%.4f,%.4f) 期望=(%.4f,%.4f,%.4f) 误差=%.3fmm/%.4fdeg",
+        tag, T1.translation().x(), T1.translation().y(), T1.translation().z(),
+        E1.translation().x(), E1.translation().y(), E1.translation().z(), pos_err, rot_err);
+
+    // 相邻点最大跳变：抓限位/奇异导出的跳支
+    double max_dq = 0, max_dp = 0, max_dr = 0;
+    int dom_joint = -1;
+    Eigen::Isometry3d prev = T0;
+    for(size_t i = 1; i < traj.size(); i++){
+        for(int j = 0; j < g_num_joints; j++){
+            double d = std::fabs((double)traj[i][j] - traj[i-1][j]);
+            if(d > max_dq){ max_dq = d; dom_joint = j; }
+        }
+        const Eigen::Isometry3d T = fk(traj[i]);
+        max_dp = std::max(max_dp, (T.translation() - prev.translation()).norm() * 1000.0);
+        max_dr = std::max(max_dr, Eigen::AngleAxisd(prev.linear().transpose() * T.linear()).angle() * rad2deg);
+        prev = T;
+    }
+    RCLCPP_INFO(LOGGER, "[%s] 相邻点最大跳变: 关节=%.4frad(轴%d) 末端位移=%.2fmm 转角=%.3fdeg",
+        tag, max_dq, dom_joint, max_dp, max_dr);
 }
 // 监视线程：检测"卡死/无进展"（到轨迹终点的距离长期不缩小即触发重规划）
 // 只看"是否在靠近终点"，不比较中间轨迹点，因此对下位机滞后/不同步免疫
@@ -649,7 +765,7 @@ static void monitor_thread_func(){
             int64_t age = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count() - g_last_feedback_ms.load();
             RCLCPP_WARN_THROTTLE(LOGGER, *g_node->get_clock(), 200,
-                "DIAG dist=%.3f best=%.3f dom_axis=%d(%.3f->%.3f) fb_age=%ldms",
+                "诊断 dist=%.3f best=%.3f 主偏差轴=%d(%.3f->%.3f) 反馈延迟=%ldms",
                 dist, best_dist, dom, actual[dom], last_pt[dom], (long)age);
         }
 
@@ -658,7 +774,7 @@ static void monitor_thread_func(){
             best_dist = dist;
             last_progress = now;
         } else if(now - last_progress > stall_timeout){            // 长时间不再靠近 → 卡死
-            RCLCPP_WARN(LOGGER, "No progress (dist=%.3f, best=%.3f), request abort", dist, best_dist);
+            RCLCPP_WARN(LOGGER, "长时间无进展 (dist=%.3f, best=%.3f), 请求中止", dist, best_dist);
             g_exec_fail_reason = 1;                                // 由规划线程统一发0x03并回IDLE
         }
     }
@@ -694,9 +810,9 @@ static void serial_thread_func() {
                             g_recv_req = req; // 保存新计划
                         }
                         g_state = State::PLANNING;
-                        RCLCPP_INFO(LOGGER, "Received PlanReq: pose = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", req.pose[0], req.pose[1], req.pose[2], req.pose[3], req.pose[4], req.pose[5]);
+                        RCLCPP_INFO(LOGGER, "收到 PlanReq(0x01): 位姿 = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", req.pose[0], req.pose[1], req.pose[2], req.pose[3], req.pose[4], req.pose[5]);
                     } else {
-                        RCLCPP_ERROR(LOGGER, "Failed to parse PlanReq");
+                        RCLCPP_ERROR(LOGGER, "PlanReq(0x01) 解析失败");
                     }
                 }
                 else if(recv_cmd == protocal::Cmd::PLAN_REQ3){
@@ -713,10 +829,26 @@ static void serial_thread_func() {
                             g_cart_goal.linear() = d.linear() * cur.linear();
                         }
                         g_state = State::PLANNING3;
-                        RCLCPP_INFO(LOGGER, "Received PlanReq3: delta = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", req3.delta[0], req3.delta[1], req3.delta[2], req3.delta[3], req3.delta[4], req3.delta[5]);
-                        RCLCPP_INFO(LOGGER, "Cartesian goal: (%.3f, %.3f, %.3f)", g_cart_goal.translation().x(), g_cart_goal.translation().y(), g_cart_goal.translation().z());
+                        RCLCPP_INFO(LOGGER, "收到 PlanReq3(0x06): 增量 = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", req3.delta[0], req3.delta[1], req3.delta[2], req3.delta[3], req3.delta[4], req3.delta[5]);
+                        RCLCPP_INFO(LOGGER, "笛卡尔目标: (%.3f, %.3f, %.3f)", g_cart_goal.translation().x(), g_cart_goal.translation().y(), g_cart_goal.translation().z());
                     } else {
-                        RCLCPP_ERROR(LOGGER, "Failed to parse PlanReq3");
+                        RCLCPP_ERROR(LOGGER, "PlanReq3(0x06) 解析失败");
+                    }
+                }
+                else if(recv_cmd == protocal::Cmd::PLAN_REQ_ARC){
+                    protocal::PlanReqArc req_arc;
+                    if(parse_arc_frame(rx_buffer.data() + i, total, &req_arc)){
+                        {
+                            std::lock_guard<std::mutex> lock(g_arc_mutex);
+                            g_arc_req = req_arc;
+                        }
+                        g_state = State::PLANNING_ARC;
+                        RCLCPP_INFO(LOGGER, "收到 PlanReqArc(0x07): 轴点=(%.4f, %.4f, %.4f) 轴方向=(%.3f, %.3f, %.3f) 转角=%.2f度",
+                            req_arc.axis_point[0], req_arc.axis_point[1], req_arc.axis_point[2],
+                            req_arc.axis_dir[0], req_arc.axis_dir[1], req_arc.axis_dir[2],
+                            req_arc.theta * rad2deg);
+                    } else {
+                        RCLCPP_ERROR(LOGGER, "PlanReqArc(0x07) 解析失败");
                     }
                 }
                 else if(recv_cmd == protocal::Cmd::PLAN_FEEDBACK){
@@ -741,13 +873,20 @@ static void serial_thread_func() {
                         if constexpr(!CALIB_MODE){
                             if(fb.step_idx != g_last_feedback_step){
                                 g_last_feedback_step = fb.step_idx;
-                                RCLCPP_INFO(LOGGER, "Received PlanFeedback: joints = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f] step=%d", g_feedback_joints[0], g_feedback_joints[1], g_feedback_joints[2], g_feedback_joints[3], g_feedback_joints[4], g_feedback_joints[5], g_feedback_joints[6], fb.step_idx);
+                                RCLCPP_INFO(LOGGER, "收到 PlanFeedback(0x04): 关节角 = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f] 步=%d", g_feedback_joints[0], g_feedback_joints[1], g_feedback_joints[2], g_feedback_joints[3], g_feedback_joints[4], g_feedback_joints[5], g_feedback_joints[6], fb.step_idx);
+                            }
+                            // 每 500ms 打印一次由反馈 FK 得到的 TCP 位姿，便于与 RViz/实机比对
+                            static auto last_tcp_print = std::chrono::steady_clock::now();
+                            auto now_tcp = std::chrono::steady_clock::now();
+                            if(now_tcp - last_tcp_print >= std::chrono::milliseconds(1000)){
+                                last_tcp_print = now_tcp;
+                                print_tcp_pose();
                             }
                         }
                     }
                     //  else {
                     //     if constexpr(!CALIB_MODE){
-                    //         RCLCPP_WARN_THROTTLE(LOGGER, *g_node->get_clock(), 2000, "Failed to parse PlanFeedback, frame skipped");
+                    //         RCLCPP_WARN_THROTTLE(LOGGER, *g_node->get_clock(), 2000, "PlanFeedback(0x04) 解析失败, 已跳过该帧");
                     //     }
                     // }
                 }
@@ -785,7 +924,7 @@ static void send_trajectory(const std::vector<std::vector<float> >& traj, bool a
             for(int k = 0; k < 4; k++)buf.push_back(p[k]);
 
         }
-        RCLCPP_INFO(LOGGER, "Sent joints = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", traj[i][0], traj[i][1], traj[i][2], traj[i][3], traj[i][4], traj[i][5], traj[i][6]);
+        RCLCPP_INFO(LOGGER, "下发关节角 = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", traj[i][0], traj[i][1], traj[i][2], traj[i][3], traj[i][4], traj[i][5], traj[i][6]);
         send_frame(buf.data(), buf.size());
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -835,7 +974,7 @@ static void planning_thread_func(){
 
                 // 用四元数打印，避免 eulerAngles 的多解问题
                 Eigen::Quaterniond q_print(target.rotation());
-                RCLCPP_INFO(LOGGER, "Planning: (%.3f,%.3f,%.3f) quat(%.3f,%.3f,%.3f,%.3f)",
+                RCLCPP_INFO(LOGGER, "规划目标: (%.3f,%.3f,%.3f) 四元数(%.3f,%.3f,%.3f,%.3f)",
                         target.translation().x(), target.translation().y(), target.translation().z(),
                         q_print.w(), q_print.x(), q_print.y(), q_print.z());
 
@@ -844,10 +983,10 @@ static void planning_thread_func(){
                 if(!traj.empty()){
                     send_trajectory(traj);
                     size_t total_frames = traj.size();
-                    RCLCPP_INFO(LOGGER, "Sent %zu points, entering EXECUTING", total_frames);
+                    RCLCPP_INFO(LOGGER, "已下发 %zu 点, 进入执行状态", total_frames);
                     start_execution(traj);
                 } else {
-                    fail_and_idle("Plan failed");
+                    fail_and_idle("规划失败");
                 }
                 break;
             }
@@ -864,42 +1003,93 @@ static void planning_thread_func(){
                 auto traj = cartesian_plan_(waypoints);
 
                 if(!traj.empty()){
+                    check_traj(traj, waypoints, "CART");
                     send_trajectory(traj);
                     size_t total_frames = traj.size();
-                    RCLCPP_INFO(LOGGER, "Sent %zu points, entering EXECUTING", total_frames);
+                    RCLCPP_INFO(LOGGER, "已下发 %zu 点, 进入执行状态", total_frames);
                     start_execution(traj);
                 } else {
-                    fail_and_idle("Plan failed");
+                    fail_and_idle("规划失败");
+                }
+                break;
+            }
+            case State::PLANNING_ARC: {
+                protocal::PlanReqArc req;
+                {
+                    std::lock_guard<std::mutex> lock(g_arc_mutex);
+                    req = g_arc_req;
+                }
+                const Eigen::Vector3d axis_point(req.axis_point[0], req.axis_point[1], req.axis_point[2]);
+                Eigen::Vector3d axis_dir(req.axis_dir[0], req.axis_dir[1], req.axis_dir[2]);
+                const double theta = req.theta;
+
+                if(!axis_point.allFinite() || !axis_dir.allFinite() || axis_dir.norm() < 1e-6){
+                    fail_and_idle("Arc rejected: invalid axis");
+                    break;
+                }
+                // if(!std::isfinite(theta) || std::fabs(theta) < 1e-6 || std::fabs(theta) > M_PI + 1e-6){
+                //     fail_and_idle("圆弧请求被拒绝: 转角大小必须满足 0 < |theta| <= PI");
+                //     break;
+                // }
+                axis_dir.normalize();
+
+                const Eigen::Isometry3d start = current_tcp_pose();
+                const int N = arc_segments(theta);
+                auto waypoints = arc_waypoints_(axis_point, axis_dir, theta, start, N);
+                auto traj = cartesian_plan_(waypoints);
+
+                if(!traj.empty()){
+                    check_traj(traj, waypoints, "ARC");
+                    send_trajectory(traj);
+                    size_t total_frames = traj.size();
+                    RCLCPP_INFO(LOGGER, "圆弧已下发 %zu 点 (%d 段), 进入执行状态", total_frames, N);
+                    start_execution(traj);
+                } else {
+                    fail_and_idle("圆弧规划失败");
                 }
                 break;
             }
             case State::EXECUTING:{
                 // 监视线程判定卡死：不再重规划，直接回错误码并回IDLE
                 if(g_exec_fail_reason.load() != 0){
-                    fail_and_idle("Execution stalled, abort");
+                    fail_and_idle("执行卡死, 中止");
                     break;
                 }
                 // 完成判定：反馈关节角与轨迹终点各轴足够接近，且连续多帧稳定在阈值内
-                const double arrive_eps = 0.1;   // 到位阈值(rad)
+                const double arrive_eps = 0.05;   // 到位阈值(rad)
                 const int arrive_frames = 3;     // 连续满足帧数(约150ms)
                 std::vector<double> actual;
                 {
                     std::lock_guard<std::mutex> lock(g_feedback_mutex);
                     actual = g_feedback_joints;
                 }
-                bool arrived = !actual.empty();
-                if(arrived){
+                std::vector<float> last_pt;   // 轨迹终点拷贝，锁外安全使用
+                {
                     std::lock_guard<std::mutex> lock(g_exec_mutex);
-                    auto& last_pt = g_exec_traj.back();
+                    if(!g_exec_traj.empty())last_pt = g_exec_traj.back();
+                }
+                bool arrived = !actual.empty() && !last_pt.empty();
+                if(arrived){
                     for(int j = 0; j < g_num_joints; j++){
                         if(std::fabs(actual[j] - last_pt[j]) > arrive_eps){ arrived = false; break; }
                     }
                 }
                 g_arrived_cnt = arrived ? g_arrived_cnt + 1 : 0;
                 if(g_arrived_cnt >= arrive_frames){
+                    // 执行残差（只打印）：反馈FK 与 规划末点FK 的位置/姿态差
+                    moveit::core::RobotState sa(g_robot_model), sc(g_robot_model);
+                    sa.setJointGroupPositions(g_joint_group, actual);
+                    sc.setJointGroupPositions(g_joint_group, std::vector<double>(last_pt.begin(), last_pt.end()));
+                    sa.update(); sc.update();
+                    const moveit::core::LinkModel* tip = g_joint_group->getLinkModel("link11");
+                    const Eigen::Isometry3d Ta = sa.getGlobalLinkTransform(tip);
+                    const Eigen::Isometry3d Tc = sc.getGlobalLinkTransform(tip);
+                    RCLCPP_INFO(LOGGER, "到位残差: 位置=%.2fmm 姿态=%.3fdeg",
+                        (Ta.translation() - Tc.translation()).norm() * 1000.0,
+                        Eigen::AngleAxisd(Ta.linear().transpose() * Tc.linear()).angle() * rad2deg);
                     g_arrived_cnt = 0;
                     g_state = State::IDLE;
-                    RCLCPP_INFO(LOGGER, "Execution complete, back to IDLE");
+                    RCLCPP_INFO(LOGGER, "执行完成, 回到 IDLE");
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 break;
@@ -924,7 +1114,7 @@ static void planning_thread_func(){
  *       offset 看"发 ros=0 时臂是否停在约定零位"；sign 看"发 +raw 时臂转向"。
  */
 static void calib_loop() {
-    RCLCPP_INFO(LOGGER, "==== CALIB MODE ====  输入: <轴号0-6> <raw目标rad>  例: 0 0.4   其余轴保持当前位；Ctrl-D退出");
+    RCLCPP_INFO(LOGGER, "==== 标定模式 ====  输入: <轴号0-6> <raw目标rad>  例: 0 0.4   其余轴保持当前位；Ctrl-D退出");
     while (g_running && rclcpp::ok()) {
         printf("[CALIB] 输入 <轴号0-6> <raw目标rad> > ");
         fflush(stdout);
@@ -965,7 +1155,7 @@ int main(int argc, char** argv){
 
 #if CALIB_MODE
     // 标定模式：跳过 MoveIt，仅保留串口线程 + 手动下发
-    RCLCPP_INFO(LOGGER, "Calibration mode: MoveIt skipped");
+    RCLCPP_INFO(LOGGER, "标定模式: 跳过 MoveIt");
     std::thread serial_thr(serial_thread_func);
     calib_loop();
     g_running = false;
@@ -975,10 +1165,10 @@ int main(int argc, char** argv){
     return 0;
 #else
     if(!init_moveit()){
-        RCLCPP_FATAL(LOGGER, "MoveIt! init failed");
+        RCLCPP_FATAL(LOGGER, "MoveIt 初始化失败");
         return 1;
     }
-    RCLCPP_INFO(LOGGER, "System ready, waiting for requests...");
+    RCLCPP_INFO(LOGGER, "系统就绪, 等待请求...");
 
     // 启动串口线程和规划线程
     std::thread serial_thr(serial_thread_func);
@@ -988,7 +1178,7 @@ int main(int argc, char** argv){
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     // 停止线程
-    RCLCPP_INFO(LOGGER, "Shutting down...");
+    RCLCPP_INFO(LOGGER, "正在关闭...");
     g_running = false;
     g_state = State::IDLE;
     close_serial();
