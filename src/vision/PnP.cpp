@@ -35,10 +35,30 @@ int main()
         ++idx;
 
         const CarTarget t = tuner.add(frame, data);
+        const CarTargetPose r = toCarTargetPose(t); // 6 自由度位姿 + 目标向量
 
         targetPoint = t.point;
         targetVec = t.vec;
-        std::printf("[%4d] 反投影误差 %.2f px\n", idx, t.errMeanPx);
+
+        if (r.ok)
+        {
+            // r[0] = 六自由度 [x y z roll pitch yaw]
+            // r[1] = 三自由度向量 [x y z]
+            const cv::Vec6d pose = r[0];
+            const cv::Vec3d vec = r[1];
+
+            std::printf("[%4d] err %.2f px | 点(%.1f, %.1f, %.1f) mm"
+                        " | rpy(%.1f, %.1f, %.1f) deg"
+                        " | vec(%.3f, %.3f, %.3f)\n",
+                        idx, r.errMeanPx,
+                        pose[0], pose[1], pose[2],
+                        r.rpyDeg()[0], r.rpyDeg()[1], r.rpyDeg()[2],
+                        vec[0], vec[1], vec[2]);
+        }
+        else
+        {
+            std::printf("[%4d] 未解出：%s\n", idx, r.reason.c_str());
+        }
 
         cv::imshow("PnP", frame);
         if (cv::waitKey(1) == 27)

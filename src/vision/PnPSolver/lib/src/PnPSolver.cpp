@@ -18,6 +18,7 @@ const int kBlurKernel = 5;  // 高斯核
 const double kCannyLow = 50.0;
 const double kCannyHigh = 150.0;
 const int kCannyAperture = 3;
+const int kGradMargin = 8; // 梯度 ROI 外扩像素：Sobel 3x3 需要邻域，采样点必须离 ROI 边界足够远
 
 const int kMinContourPoints = 40;      // 轮廓点数太少直接跳过
 const float kMinGradientMag = 30.f;    // 梯度幅值低于此值，方向不可信
@@ -130,6 +131,7 @@ void preprocess(const cv::Mat &bgrFrame, cv::Mat &mask, cv::Mat &maskBlur, cv::M
 // ============================================================================
 bool extractBarCorners(const std::vector<cv::Point> &contour,
                        const cv::Mat &mag, const cv::Mat &angle,
+                       const cv::Point gradOrigin,
                        std::array<cv::Point2f, 4> &outCorners, double &cx)
 {
     const int n = static_cast<int>(contour.size());
@@ -137,14 +139,17 @@ bool extractBarCorners(const std::vector<cv::Point> &contour,
         return false;
 
     // ---- 1) 每个轮廓点的边缘方向 + 方向直方图 ----
+    // mag/angle 是"轮廓包围盒内"的局部梯度图，采样前要减去包围盒左上角坐标
     std::vector<float> ea(n, -1.f); // -1 表示梯度太弱，方向不可信
     std::array<int, 180> votes{};
     for (int i = 0; i < n; ++i)
     {
-        const cv::Point &p = contour[i];
-        if (mag.at<float>(p) < kMinGradientMag)
+        const cv::Point gp = contour[i] - gradOrigin;
+        if (gp.x < 0 || gp.y < 0 || gp.x >= mag.cols || gp.y >= mag.rows)
+            continue; // 理论上不会发生（ROI 已覆盖所有轮廓），防御性检查
+        if (mag.at<float>(gp) < kMinGradientMag)
             continue;
-        float a = std::fmod(angle.at<float>(p) + 90.f, 180.f);
+        float a = std::fmod(angle.at<float>(gp) + 90.f, 180.f);
         if (a < 0.f)
             a += 180.f;
         ea[i] = a;
@@ -433,10 +438,35 @@ bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
 
+    // ---- 梯度只在轮廓包围盒内计算 ----
+    // 整帧算 Sobel×2 + magnitude + phase 约占整条检测链 50% 的时间，
+    // 但真正被用到的只有轮廓上的几百个点。这里先求候选轮廓包围盒的并集，
+    // 只在这块区域算梯度（外扩 kGradMargin 以覆盖 Sobel 的 3x3 邻域，
+    // 保证轮廓点上的值与整帧计算完全一致）。
+    cv::Rect gradRoi;
+    for (const auto &c : contours)
+    {
+        if (static_cast<int>(c.size()) < kMinContourPoints)
+            continue; // 噪点轮廓不参与取景，也省掉后面的无效计算
+        const cv::Rect r = cv::boundingRect(c);
+        gradRoi = (gradRoi.area() == 0) ? r : (gradRoi | r);
+    }
+    if (gradRoi.area() == 0)
+    {
+        if (reason)
+            *reason = "没有有效轮廓";
+        return false;
+    }
+    gradRoi = cv::Rect(gradRoi.x - kGradMargin, gradRoi.y - kGradMargin,
+                       gradRoi.width + 2 * kGradMargin,
+                       gradRoi.height + 2 * kGradMargin) &
+              cv::Rect(0, 0, bgrFrame.cols, bgrFrame.rows);
+
     // 梯度在灰度 maskBlur 上算，比在二值 edges 上稳定得多
     cv::Mat gx, gy, mag, angle;
-    cv::Sobel(maskBlur, gx, CV_32F, 1, 0, 3);
-    cv::Sobel(maskBlur, gy, CV_32F, 0, 1, 3);
+    const cv::Mat blurRoi = maskBlur(gradRoi);
+    cv::Sobel(blurRoi, gx, CV_32F, 1, 0, 3);
+    cv::Sobel(blurRoi, gy, CV_32F, 0, 1, 3);
     cv::magnitude(gx, gy, mag);
     cv::phase(gx, gy, angle, true); // 0~360
 
@@ -446,11 +476,12 @@ bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
         std::array<cv::Point2f, 4> pts{};
     };
     std::vector<Bar> bars;
+    bars.reserve(contours.size());
 
     for (const auto &contour : contours)
     {
         Bar b;
-        if (extractBarCorners(contour, mag, angle, b.pts, b.cx))
+        if (extractBarCorners(contour, mag, angle, gradRoi.tl(), b.pts, b.cx))
             bars.push_back(b);
     }
 
@@ -577,9 +608,36 @@ CarTarget poseImpl(const std::vector<cv::Point2f> &points2D, const PnPDate &data
     const cv::Vec3d vecArmor(data.v[0], data.v[1], data.v[2]);
     out.vec = cv::Vec3d(R_armor_to_car * vecArmor);
 
+    out.R_armor_to_car = R_armor_to_car;
+
     out.errMeanPx = det.errMeanPx;
     out.ok = true;
     return out;
+}
+
+// ============================================================================
+//  旋转矩阵 -> ZYX 欧拉角（R = Rz(yaw) * Ry(pitch) * Rx(roll)）
+// ============================================================================
+cv::Vec3d rpyFromR(const cv::Matx33d &R)
+{
+    // pitch 只能取 [-90°, 90°]，R(2,0) = -sin(pitch)
+    double sp = -R(2, 0);
+    sp = std::min(1.0, std::max(-1.0, sp));
+    const double pitch = std::asin(sp);
+
+    double roll = 0.0, yaw = 0.0;
+    if (std::abs(sp) > 1.0 - 1e-9)
+    {
+        // 万向锁：pitch = ±90°，roll 与 yaw 只有和/差有意义，这里令 roll = 0
+        roll = 0.0;
+        yaw = std::atan2(-R(0, 1), R(1, 1));
+    }
+    else
+    {
+        roll = std::atan2(R(2, 1), R(2, 2));
+        yaw = std::atan2(R(1, 0), R(0, 0));
+    }
+    return cv::Vec3d(roll, pitch, yaw);
 }
 
 } // namespace
@@ -612,6 +670,96 @@ CarTarget solveCarTarget(const cv::Mat &bgrFrame, const PnPDate &data,
         return out;
     }
     return poseImpl(points2D, data, opt);
+}
+
+// ============================================================================
+//  CarTargetItem / CarTargetPose：两级索引 + 姿态换算 + 6 自由度封包
+// ============================================================================
+
+// 内层下标：位姿取 0..5，向量取 0..2
+double CarTargetItem::operator[](int k) const
+{
+    CV_Assert(k >= 0 && k < n);
+    return n == 6 ? pose[k] : vec[k];
+}
+
+// cv::Vec6d p = r[0];
+CarTargetItem::operator cv::Vec6d() const
+{
+    CV_Assert(n == 6);
+    return pose;
+}
+
+// cv::Vec3d v = r[1];
+CarTargetItem::operator cv::Vec3d() const
+{
+    CV_Assert(n == 3);
+    return vec;
+}
+
+// 外层只用两个索引：0 = 六自由度位姿，1 = 三自由度向量
+CarTargetItem CarTargetPose::operator[](int i) const
+{
+    CV_Assert(i == 0 || i == 1);
+
+    CarTargetItem item;
+    if (i == 0)
+    {
+        item.pose = pose;
+        item.n = 6;
+    }
+    else
+    {
+        item.vec = vec;
+        item.n = 3;
+    }
+    return item;
+}
+
+cv::Vec3d CarTargetPose::rpyDeg() const
+{
+    const double kRad2Deg = 180.0 / CV_PI;
+    return cv::Vec3d(pose[3] * kRad2Deg, pose[4] * kRad2Deg,
+                     pose[5] * kRad2Deg);
+}
+
+CarTargetPose toCarTargetPose(const CarTarget &t)
+{
+    CarTargetPose out;
+    out.ok = t.ok;
+    out.reason = t.reason;
+    out.errMeanPx = t.errMeanPx;
+    out.vec = t.vec;
+    out.R = t.R_armor_to_car;
+    if (!t.ok)
+        return out;
+
+    // 目标系 = 装甲板系把 Y 轴取反：
+    //   R_target_in_car = R_armor_in_car * diag(1, -1, 1)
+    // 右乘 diag(1,-1,1) 的效果就是"只把旋转矩阵第 2 列取反"，
+    // X、Z 两轴方向不变，det 仍为 +1，所以仍然是一个合法旋转。
+    const cv::Matx33d kFlipY(1, 0, 0,
+                             0, -1, 0,
+                             0, 0, 1);
+    out.R = t.R_armor_to_car * kFlipY;
+
+    // 平移部分：目标系原点就是目标点本身
+    out.pose[0] = t.point[0];
+    out.pose[1] = t.point[1];
+    out.pose[2] = t.point[2];
+
+    const cv::Vec3d rpy = rpyFromR(out.R);
+    out.pose[3] = rpy[0];
+    out.pose[4] = rpy[1];
+    out.pose[5] = rpy[2];
+
+    return out;
+}
+
+CarTargetPose solveCarTargetPose(const cv::Mat &bgrFrame, const PnPDate &data,
+                                 const CarTargetOptions &opt)
+{
+    return toCarTargetPose(solveCarTarget(bgrFrame, data, opt));
 }
 
 // ============================================================================
