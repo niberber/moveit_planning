@@ -456,6 +456,15 @@ void CameraStream::loop()
             hasNew_ = true;
         }
         cv_.notify_all();
+
+        // ★ 每帧回调：在锁外执行，避免耗时回调阻塞 wait()
+        std::function<void(const cv::Mat &)> cb;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            cb = cb_;
+        }
+        if (cb)
+            cb(frame);
     }
 }
 
@@ -483,4 +492,11 @@ bool CameraStream::wait(cv::Mat &out, int timeoutMs)
     out = latest_;
     hasNew_ = false;
     return true;
+}
+
+// 设置每帧回调（在相机线程里执行）
+void CameraStream::setCallback(std::function<void(const cv::Mat &)> cb)
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    cb_ = std::move(cb);
 }

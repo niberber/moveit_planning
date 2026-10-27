@@ -4,6 +4,7 @@
 #include <opencv2/opencv.hpp>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <thread>
 
@@ -188,6 +189,14 @@ public:
     // 阻塞：最多等 timeoutMs 毫秒，等到新帧返回 true
     bool wait(cv::Mat &out, int timeoutMs = 200);
 
+    // ★ 每帧回调：在【相机线程】里调用，参数是最新帧（BGR）
+    //   用途：在采集线程里直接做解算/统计，主线程只取结果。
+    //   注意：
+    //     1) 回调里不要做 GUI（imshow/waitKey）；
+    //     2) 回调耗时会计入采集周期（5ms 回调会拖慢帧率）；
+    //     3) 建议在 start() 之前调用本函数设置。
+    void setCallback(std::function<void(const cv::Mat &)> cb);
+
     bool running() const { return running_.load(); } // 线程是否在跑
     unsigned long long frames() const { return frames_.load(); } // 累计收到帧数
     unsigned long long misses() const { return misses_.load(); } // 累计取帧失败次数
@@ -206,4 +215,5 @@ private:
     std::condition_variable cv_;
     cv::Mat latest_;
     bool hasNew_ = false;
+    std::function<void(const cv::Mat &)> cb_; // 每帧回调（在相机线程里执行）
 };

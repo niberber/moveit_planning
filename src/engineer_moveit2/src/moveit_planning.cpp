@@ -20,19 +20,23 @@
 #include <Eigen/Geometry>                                   // 旋转矩阵
 #include <ament_index_cpp/get_package_share_directory.hpp>  // 用于定位包内 URDF/SRDF
 #include <algorithm>
+#include <cassert>
 #include <vector>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
 #include "feedback_pub.hpp"
+#include "camera.h"        // 海康相机：CameraControl + CameraStream（内部取帧线程）
+#include "PnPDate.hpp"     // PnP 标定数据
+#include "PnPSolver.hpp"   // solveCarTargetPose()
 #define NUM_JOINTS 7
 uint8_t g_num_joints = NUM_JOINTS;
 
 // 标定模式：1=标定(跳过MoveIt)，0=正常规划。标定用法见 calib_loop()
 #define CALIB_MODE 0
 
-// 反馈录制开关：1=每帧0x06写CSV，0=关闭
+// 反馈录制开关：1=每帧0x04写CSV，0=关闭
 #define RECORD_FEEDBACK 0
 
 // 笛卡尔直线规划参数
@@ -61,9 +65,18 @@ static const double joint_vel_deg[NUM_JOINTS] = {90.0, 60.0, 80.0, 90.0, 120.0, 
 #define MIN_SEND_DT 0.02                    // 最小下发间隔(s)，防止刷屏/串口过载
 #define MAX_SEND_DT 0.1                     // 最大下发间隔(s)，即改造前固定的 100ms
 
+// 步骤2~5 的目标参数：视觉/标定接入前先用常量占位（接入方法见文件末尾"视觉接入建议"）
+static const Eigen::Vector3d STEP_INSERT_DIR(-1.0, 0.0, 0.0); // 步骤2：基座系 -X 插入
+static const double STEP_INSERT_DIST = 0.10;                  // 100mm
+static const Eigen::Vector3d STEP_SHIFT_DIR(0.0, 0.0, 1.0);   // 步骤3：基座系 +Z 平移
+static const double STEP_SHIFT_DIST = 0.10;                   // 100mm
+static const Eigen::Vector3d STEP_ROT_P_AXIS(1.0, 0.0, 0.0);  // 步骤4：P轴方向（待视觉/标定给出）
+static const double STEP_ROT_P_THETA = 90.0 * deg2rad;        // 向上90°
+static const Eigen::Vector3d STEP_ROT_Q_AXIS(0.0, 1.0, 0.0);  // 步骤5：Q轴方向（待视觉/标定给出）
+static const double STEP_ROT_Q_THETA = 90.0 * deg2rad;        // 指定角（待规则/标定给出）
 #define FEEDBACK_TIMEOUT_MS 200             // 反馈超过该时长未更新则拒绝规划
 
-// 指令号分配：STM32->PC 用 0x01~0x06 与 0x0D；PC->STM32 用 0x07~0x0C
+// 指令号分配：STM32->PC 用 0x01~0x06 与 0x09；PC->STM32 用 0x07/0x08/0x0A；0x0B~0x0D 为手动调试入口
 namespace protocal {
 enum Cmd : uint16_t {
     // ---------- STM32 -> PC ----------
@@ -72,44 +85,45 @@ enum Cmd : uint16_t {
     STEP_SHIFT    = 0x03,   // 步骤3 平移100mm（二级矿完成）
     STEP_ROT_P    = 0x04,   // 步骤4 绕P轴旋转
     STEP_ROT_Q    = 0x05,   // 步骤5 绕Q轴旋转（三级矿完成）
-    PLAN_FEEDBACK = 0x06,   // 关节反馈
-    STEP_ABORT    = 0x0D,   // 强行打断：停止下发，维持当前位姿
+    STEP_ABORT    = 0x06,   // 强行打断：停止下发，维持当前位姿
+    PLAN_FEEDBACK = 0x09,   // 关节反馈（原0x04）
     // ---------- PC -> STM32 ----------
-    DBG_PLAN_REQ  = 0x07,   // 绝对位姿请求
-    DBG_REQ3      = 0x08,   // 基座系增量
-    DBG_REQ_ARC   = 0x09,   // 绕固定轴旋转固定角度
-    TRAJ_POINT    = 0x0A,   // 轨迹点帧
-    PLAN_FAIL     = 0x0B,   // 规划失败
-    STEP_DONE     = 0x0C,   // 单步完成
+    TRAJ_POINT    = 0x07,   // 轨迹点帧（原0x02）
+    PLAN_FAIL     = 0x08,   // 规划失败（原0x03）
+    STEP_DONE     = 0x0A,   // 单步完成
+    // ---------- 手动调试入口（原编号保留，仅改号）----------
+    DBG_PLAN_REQ  = 0x0B,   // 绝对位姿请求（原0x01）
+    DBG_REQ3      = 0x0C,   // 基座系增量（原0x06）
+    DBG_REQ_ARC   = 0x0D,   // 绕固定轴旋转固定角度（原0x07）
 };
 // ==================== 帧格式定义 ====================
-// STM32 -> PC: STEP_APPROACH~STEP_ROT_Q(0x01~0x05)、STEP_ABORT(0x0D) 无载荷
-// STM32 -> PC: PLAN_FEEDBACK(0x06) + step_idx(2) + joints[7](28)
-// PC -> STM32: TRAJ_POINT(0x0A) + idx(2) + joints[7](28)
+// STM32 -> PC: STEP_APPROACH~STEP_ABORT(0x01~0x06) 无载荷
+// STM32 -> PC: PLAN_FEEDBACK(0x09) + step_idx(2) + joints[7](28)
+// PC -> STM32: TRAJ_POINT(0x07) + idx(2) + joints[7](28)
 #pragma pack(push, 1)
 struct PlanReq {
-    uint16_t cmd;        // 0x07
+    uint16_t cmd;        // 0x0B
     float pose[6];       // 目标TCP位姿: xyz(3) + rpy(3), base_link系
 };
 
 struct PlanFeedback {
-    uint16_t cmd;        // 0x06
+    uint16_t cmd;        // 0x09
     uint16_t step_idx;   // 当前执行到的轨迹点索引
     float joints[NUM_JOINTS]; // 当前关节角度
 };
 
 struct StepDone {
-    uint16_t cmd;        // 0x0C
+    uint16_t cmd;        // 0x0A
     uint16_t step;       // 完成的步骤号(1~5)
 };
 
 struct PlanReq3{
-    uint16_t cmd;        // 0x08
+    uint16_t cmd;        // 0x0C
     float delta[6];      // 基座系相对当前末端位姿的变换: [dx,dy,dz, drx,dry,drz]
 };
 
 struct PlanReqArc{
-    uint16_t cmd;          // 0x09
+    uint16_t cmd;          // 0x0D
     float axis_point[3];   // 轴上任意一点, base_link系 (m)
     float axis_dir[3];     // 旋转轴方向, base_link系, 不要求已归一化
     float theta;           // 带符号转角(rad), 右手定则, |theta| <= PI
@@ -165,7 +179,7 @@ static uint16_t crc16(const uint8_t* data, size_t len){
 }
 
 static rclcpp::Node::SharedPtr g_node;
-static std::string g_serial_port = "/dev/ttyUSB0";
+static std::string g_serial_port = "/dev/ttyUSB1";
 static int g_serial_fd = -1;
 
 // 状态机状态
@@ -177,7 +191,7 @@ enum class State{
 static std::atomic<State> g_state = State::IDLE; // 状态机状态
 static std::atomic<bool> g_running = true;       // 是否在运行中
 
-// 规划请求种类：0x01~0x05 的单步指令与 0x07~0x09 的手动调试入口共用同一个规划状态
+// 规划请求种类：0x01~0x05 的单步指令与 0x0B~0x0D 的手动调试入口共用同一个规划状态
 // 数值与 protocal::Cmd 一致，便于直接用 (int)kind 取步骤号
 enum class PlanKind : int{
     NONE          = 0,
@@ -191,21 +205,21 @@ enum class PlanKind : int{
     DBG_ARC       = protocal::Cmd::DBG_REQ_ARC
 };
 static std::atomic<PlanKind> g_plan_kind{PlanKind::NONE}; // 待规划项（串口线程写，规划线程取）
-static std::atomic<bool> g_abort_stream{false};           // 0x0D 打断：停发并回 IDLE
-static PlanKind g_exec_kind = PlanKind::NONE;             // 本轮已下发的规划项（到位后据此决定是否回 0x0C）
+static std::atomic<bool> g_abort_stream{false};           // 0x06 打断：停发并回 IDLE
+static PlanKind g_exec_kind = PlanKind::NONE;             // 本轮已下发的规划项（到位后据此决定是否回 0x0A）
 
 // 请求/反馈
 static protocal::PlanReq g_recv_req;  // 接收的规划请求
 static std::mutex g_req_mutex;         // 保护 g_recv_req / g_cart_goal（串口线程写，规划线程读）
-static Eigen::Isometry3d g_cart_goal; // 0x08 解析出的绝对目标位姿
-static protocal::PlanReqArc g_arc_req; // 0x09 圆弧请求
+static Eigen::Isometry3d g_cart_goal; // 0x0C 解析出的绝对目标位姿
+static protocal::PlanReqArc g_arc_req; // 0x0D 圆弧请求
 static std::mutex g_arc_mutex;         // 保护 g_arc_req（串口线程写，规划线程读）
 static std::atomic<int> g_exec_fail_reason{0};  // 执行期失败原因：0=无 1=无进展卡死（监视线程写，规划线程统一处理）
 
 // PlanFeedback 缓冲区（无锁 atomic 供监视线程读）
 static std::vector<double> g_feedback_joints(g_num_joints, 0.0);
 static std::mutex g_feedback_mutex; // 保护反馈的互斥锁
-static std::atomic<int64_t> g_last_feedback_ms{0}; // 最近一次收到0x06反馈的时刻(steady_clock, ms)
+static std::atomic<int64_t> g_last_feedback_ms{0}; // 最近一次收到0x04反馈的时刻(steady_clock, ms)
 static const double g_joint_offset[NUM_JOINTS] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 // 标定结论：7轴方向与URDF一致
 static const double g_joint_sign[NUM_JOINTS]  = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
@@ -263,7 +277,7 @@ static void close_serial() {
 }
 
 // 组帧并发到串口：AA55 + seq + len(2,=载荷字节数) + cmd(2) + 载荷 + CRC16
-// 串口线程(回0x0B)与规划线程(发点/回0x0C)都会调用，加锁避免帧交错
+// 串口线程(回0x08)与规划线程(发点/回0x0A)都会调用，加锁避免帧交错
 static std::mutex g_send_mutex;
 static void send_frame(const uint8_t* data, size_t len) {
     std::lock_guard<std::mutex> lock(g_send_mutex);
@@ -291,7 +305,7 @@ static void send_frame(const uint8_t* data, size_t len) {
     }
 }
 
-// 回规划失败帧(0x0B)：串口线程(拒绝新指令)与规划线程(规划失败)共用
+// 回规划失败帧(0x08)：串口线程(拒绝新指令)与规划线程(规划失败)共用
 static void send_fail() {
     uint16_t cmd = protocal::Cmd::PLAN_FAIL;
     send_frame((uint8_t*)&cmd, 2);
@@ -827,14 +841,14 @@ static void monitor_thread_func(){
             last_progress = now;
         } else if(now - last_progress > stall_timeout){            // 长时间不再靠近 → 卡死
             RCLCPP_WARN(LOGGER, "长时间无进展 (dist=%.3f, best=%.3f), 请求中止", dist, best_dist);
-            g_exec_fail_reason = 1;                                // 由规划线程统一发0x0B并回IDLE
+            g_exec_fail_reason = 1;                                // 由规划线程统一发0x03并回IDLE
         }
     }
 }
 
 static void abort_to_idle();   // 定义在 fail_and_idle 之后
 
-// 登记一个规划需求：非 IDLE 时拒绝(回0x0B)，避免执行中被新指令打断
+// 登记一个规划需求：非 IDLE 时拒绝(回0x08)，避免执行中被新指令打断
 static bool take_request(PlanKind kind){
     if(g_state.load() != State::IDLE){
         RCLCPP_WARN(LOGGER, "执行中收到新指令 0x%02X, 已拒绝", (int)kind);
@@ -884,10 +898,10 @@ static void serial_thread_func() {
                             g_recv_req = req; // 保存新计划
                         }
                         if(take_request(PlanKind::DBG_POSE)){
-                            RCLCPP_INFO(LOGGER, "收到 PlanReq(0x07): 位姿 = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", req.pose[0], req.pose[1], req.pose[2], req.pose[3], req.pose[4], req.pose[5]);
+                            RCLCPP_INFO(LOGGER, "收到 PlanReq(0x0B): 位姿 = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", req.pose[0], req.pose[1], req.pose[2], req.pose[3], req.pose[4], req.pose[5]);
                         }
                     } else {
-                        RCLCPP_ERROR(LOGGER, "PlanReq(0x07) 解析失败");
+                        RCLCPP_ERROR(LOGGER, "PlanReq(0x0B) 解析失败");
                     }
                 }
                 else if(recv_cmd == protocal::Cmd::DBG_REQ3){
@@ -903,11 +917,11 @@ static void serial_thread_func() {
                             g_cart_goal.linear() = d.linear() * cur.linear();
                         }
                         if(take_request(PlanKind::DBG_DELTA)){
-                            RCLCPP_INFO(LOGGER, "收到 PlanReq3(0x08): 增量 = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", req3.delta[0], req3.delta[1], req3.delta[2], req3.delta[3], req3.delta[4], req3.delta[5]);
+                            RCLCPP_INFO(LOGGER, "收到 PlanReq3(0x0C): 增量 = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", req3.delta[0], req3.delta[1], req3.delta[2], req3.delta[3], req3.delta[4], req3.delta[5]);
                             RCLCPP_INFO(LOGGER, "笛卡尔目标: (%.3f, %.3f, %.3f)", g_cart_goal.translation().x(), g_cart_goal.translation().y(), g_cart_goal.translation().z());
                         }
                     } else {
-                        RCLCPP_ERROR(LOGGER, "PlanReq3(0x08) 解析失败");
+                        RCLCPP_ERROR(LOGGER, "PlanReq3(0x0C) 解析失败");
                     }
                 }
                 else if(recv_cmd == protocal::Cmd::DBG_REQ_ARC){
@@ -918,13 +932,13 @@ static void serial_thread_func() {
                             g_arc_req = req_arc;
                         }
                         if(take_request(PlanKind::DBG_ARC)){
-                            RCLCPP_INFO(LOGGER, "收到 PlanReqArc(0x09): 轴点=(%.4f, %.4f, %.4f) 轴方向=(%.3f, %.3f, %.3f) 转角=%.2f度",
+                            RCLCPP_INFO(LOGGER, "收到 PlanReqArc(0x0D): 轴点=(%.4f, %.4f, %.4f) 轴方向=(%.3f, %.3f, %.3f) 转角=%.2f度",
                                 req_arc.axis_point[0], req_arc.axis_point[1], req_arc.axis_point[2],
                                 req_arc.axis_dir[0], req_arc.axis_dir[1], req_arc.axis_dir[2],
                                 req_arc.theta * rad2deg);
                         }
                     } else {
-                        RCLCPP_ERROR(LOGGER, "PlanReqArc(0x09) 解析失败");
+                        RCLCPP_ERROR(LOGGER, "PlanReqArc(0x0D) 解析失败");
                     }
                 }
                 else if(recv_cmd == protocal::Cmd::PLAN_FEEDBACK){
@@ -949,7 +963,7 @@ static void serial_thread_func() {
                         if constexpr(!CALIB_MODE){
                             if(fb.step_idx != g_last_feedback_step){
                                 g_last_feedback_step = fb.step_idx;
-                                RCLCPP_INFO(LOGGER, "收到 PlanFeedback(0x06): 关节角 = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f] 步=%d", g_feedback_joints[0], g_feedback_joints[1], g_feedback_joints[2], g_feedback_joints[3], g_feedback_joints[4], g_feedback_joints[5], g_feedback_joints[6], fb.step_idx);
+                                RCLCPP_INFO(LOGGER, "收到 PlanFeedback(0x09): 关节角 = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f] 步=%d", g_feedback_joints[0], g_feedback_joints[1], g_feedback_joints[2], g_feedback_joints[3], g_feedback_joints[4], g_feedback_joints[5], g_feedback_joints[6], fb.step_idx);
                             }
                             // 每 500ms 打印一次由反馈 FK 得到的 TCP 位姿，便于与 RViz/实机比对
                             static auto last_tcp_print = std::chrono::steady_clock::now();
@@ -962,7 +976,7 @@ static void serial_thread_func() {
                     }
                     //  else {
                     //     if constexpr(!CALIB_MODE){
-                    //         RCLCPP_WARN_THROTTLE(LOGGER, *g_node->get_clock(), 2000, "PlanFeedback(0x06) 解析失败, 已跳过该帧");
+                    //         RCLCPP_WARN_THROTTLE(LOGGER, *g_node->get_clock(), 2000, "PlanFeedback(0x04) 解析失败, 已跳过该帧");
                     //     }
                     // }
                 }
@@ -1005,7 +1019,7 @@ static void send_trajectory(const std::vector<std::vector<float> >& traj, bool a
     for(size_t i = 0; i < traj.size(); i++){
         if(!g_running || g_abort_stream.load())break;
         std::vector<uint8_t> buf;
-        buf.push_back(protocal::Cmd::TRAJ_POINT & 0xFF);      // 0x0A 轨迹点帧
+        buf.push_back(protocal::Cmd::TRAJ_POINT & 0xFF);      // 0x07 轨迹点帧（原0x02）
         buf.push_back((protocal::Cmd::TRAJ_POINT >> 8) & 0xFF);
         buf.push_back(i & 0xFF);
         buf.push_back(i >> 8);
@@ -1029,7 +1043,7 @@ static void send_trajectory(const std::vector<std::vector<float> >& traj, bool a
     RCLCPP_INFO(LOGGER, "下发完成: %zu 点, 预计耗时 %.0f ms (原固定节奏 %.0f ms)", traj.size(), total_dt * 1000.0, traj.size() * 100.0);
 }
 
-// 统一失败出口：回错误码0x0B并回到IDLE，以便接收下一个目标
+// 统一失败出口：回错误码0x08并回到IDLE，以便接收下一个目标
 static void fail_and_idle(const char* reason){
     RCLCPP_ERROR(LOGGER, "%s", reason);
     send_fail();
@@ -1043,7 +1057,7 @@ static void fail_and_idle(const char* reason){
     g_state = State::IDLE;
 }
 
-// 打断出口(0x0D)：停发并回IDLE。臂会停在最后收到的点上，即维持当前位姿（串口线程/规划线程都可调用）
+// 打断出口(0x06)：停发并回IDLE。臂会停在最后收到的点上，即维持当前位姿（串口线程/规划线程都可调用）
 static void abort_to_idle(){
     if(g_state.load() == State::IDLE)return;
     g_abort_stream = true;
@@ -1069,25 +1083,146 @@ static void start_execution(const std::vector<std::vector<float> >& traj){
     g_state = State::EXECUTING;
 }
 
-// ==================== 视觉接口（当前为桩，接入方法见 src/vision/PnP.cpp 末尾注释）====================
-// 一次识别给出各步骤所需的量（base_link 系；长度 m，角度 rad）
-//   0x01 接近      -> pose(位置) + rpy(姿态)
-//   0x02/0x03 平移 -> delta(平移增量)
-//   0x04/0x05 旋转 -> axis_point + axis_dir + theta
-struct VisionTarget{
-    bool ok = false;                                      // 是否解算成功
-    Eigen::Vector3d pose = Eigen::Vector3d::Zero();       // 0x01 目标TCP位置(m)
-    Eigen::Vector3d rpy = Eigen::Vector3d::Zero();        // 0x01 目标TCP姿态(rad)
-    Eigen::Vector3d delta = Eigen::Vector3d::Zero();      // 0x02/0x03 平移增量(m)
-    Eigen::Vector3d axis_point = Eigen::Vector3d::Zero(); // 0x04/0x05 旋转轴上的点(m)
-    Eigen::Vector3d axis_dir = Eigen::Vector3d::UnitX();  // 0x04/0x05 旋转轴方向
-    double theta = 0.0;                                   // 0x04/0x05 旋转角度(rad)
-    double err = -1.0;                                    // 反投影误差(px)
+// ==================== 视觉接口：海康相机 + PnP ====================
+// 相机参数（按现场调整）
+static const int VISION_CAM_INDEX   = 0;      // 相机序列索引（枚举到的第几台）
+static const int VISION_EXPOSURE_US = 8000;   // 曝光时间(us)
+static const int VISION_GAIN_DB     = 15;     // 信号放大增益(dB)
+static const int VISION_BUFFER_NUM  = 2;      // 图像缓存节点数
+
+static PnPDate       g_pnp_data;              // 标定数据（内参/畸变/3D点，均已有静态默认值）
+static CameraControl g_cam;                   // 相机句柄持有者
+static CameraStream *g_stream = nullptr;      // ★ 相机内部线程：死循环取图，缓存最新一帧
+static PnPTuner      g_pnp_tuner;             // 累计重投影误差，给出 points3D 调整建议
+
+// vt[0] / vt[1] 取出来的项：6 维位姿 或 3 维向量
+struct VisionItem{
+    Eigen::Matrix<double,6,1> pose = Eigen::Matrix<double,6,1>::Zero();
+    Eigen::Vector3d vec = Eigen::Vector3d::Zero();
+    int n = 6;                       // 6 = 位姿；3 = 向量
+
+    int size() const { return n; }
+
+    // 内层索引：0 ~ n-1
+    double operator[](int k) const {
+        assert(k >= 0 && k < n);
+        return n == 6 ? pose[k] : vec[k];
+    }
+
+    // 直接赋给定长向量：Eigen::Matrix<double,6,1> m = vt[0];
+    operator Eigen::Matrix<double,6,1>() const { return pose; }
+    operator Eigen::Vector3d() const { return vec; }
 };
-// 取一帧 -> PnP -> 各步骤目标量；视觉库尚未接入，先直接返回失败（对应指令回0x0B）
-static VisionTarget vision_locate(){
+
+struct VisionTarget{
+    bool ok = false;                                 // 是否解算成功
+    Eigen::Vector3d p = Eigen::Vector3d::Zero();     // 目标点 base_link系(m)
+    Eigen::Vector3d v = Eigen::Vector3d::UnitX();    // 目标向量 base_link系
+    Eigen::Vector3d rpy = Eigen::Vector3d::Zero();   // 目标姿态 roll/pitch/yaw(rad)
+    double err = -1.0;                               // 反投影误差(px)
+
+    // ★ 两级索引：vt[0] = 六自由度 [x y z roll pitch yaw]，vt[1] = 三维向量 [x y z]
+    //   再往下一层：vt[0][3] -> roll，vt[1][2] -> v.z
+    //   也可直接赋给定长向量：Eigen::Matrix<double,6,1> m = vt[0];
+    VisionItem operator[](int i) const {
+        assert(i == 0 || i == 1);
+        VisionItem it;
+        if(i == 0){ it.pose << p, rpy; it.n = 6; }
+        else      { it.vec = v;        it.n = 3; }
+        return it;
+    }
+};
+
+// ★ 相机线程里的每帧回调：解算 + 打印重投影误差 + 定期给三维坐标修正建议
+static void vision_on_frame(const cv::Mat &frame)
+{
+    // PnPTuner::add() 内部完成检测+解算，并累计每个 3D 点的偏差
+    const CarTarget t = g_pnp_tuner.add(frame, g_pnp_data);
+    if(!t.ok){
+        RCLCPP_WARN_THROTTLE(LOGGER, *g_node->get_clock(), 2000,
+                             "视觉解算失败: %s", t.reason.c_str());
+        return;
+    }
+
+    // 重投影误差（每秒最多一条，避免刷屏）
+    RCLCPP_INFO_THROTTLE(LOGGER, *g_node->get_clock(), 1000,
+        "视觉: 重投影误差=%.2f px | 目标点=(%.1f, %.1f, %.1f) mm",
+        t.errMeanPx, t.point[0], t.point[1], t.point[2]);
+
+    // 每 100 帧输出一次 points3D 调整建议
+    if(g_pnp_tuner.frames() % 100 == 0){
+        RCLCPP_INFO(LOGGER, "%s", g_pnp_tuner.advice(g_pnp_data).c_str());
+    }
+}
+
+// 开相机 + 起取帧线程；只在 main 启动时调一次
+static bool vision_init()
+{
+    CameraControl::sdk_initialize();
+    CameraControl::enumerate_devices();
+    g_cam.create_camerahandle(VISION_CAM_INDEX);
+    g_cam.open_camera();
+    g_cam.set_exposuregain(VISION_EXPOSURE_US, VISION_GAIN_DB);
+    g_cam.set_buffer(VISION_BUFFER_NUM);
+    g_cam.start_streaming();              // 必须先起流，否则 grab 取不到图
+
+    g_stream = new CameraStream(g_cam);
+    g_stream->setCallback(vision_on_frame);   // ★ 相机线程内每帧解算 + 打印误差/建议
+    g_stream->start();                    // ★ 起相机内部线程（死循环取图）
+
+    // 自检：500ms 内能拿到一帧就算通了（目标可能不在视野内，不以此判失败）
+    cv::Mat frame;
+    if(!g_stream->wait(frame, 500)){
+        RCLCPP_ERROR(LOGGER, "相机自检失败: 500ms 内没有收到图像");
+        return false;
+    }
+    RCLCPP_INFO(LOGGER, "相机就绪: 首帧 %dx%d", frame.cols, frame.rows);
+    return true;
+}
+
+// 停相机：顺序不能改
+static void vision_shutdown()
+{
+    g_cam.stop_stream();                  // 让阻塞中的 grab 立刻返回
+    if(g_stream){
+        g_stream->stop();                 // 唤醒 wait() 并 join 相机线程
+        delete g_stream;
+        g_stream = nullptr;
+    }
+    g_cam.close_camera();
+    g_cam.destroy_camerahandle();         // 必须在 sdk_finalize 之前
+    CameraControl::sdk_finalize();
+}
+
+// ★ 取缓存里的最新一帧 -> PnP 解算
+static VisionTarget vision_locate()
+{
     VisionTarget t;
-    RCLCPP_ERROR(LOGGER, "视觉未接入, 无法取目标（接入方法见 src/vision/PnP.cpp 末尾注释）");
+    if(!g_stream){
+        RCLCPP_ERROR(LOGGER, "视觉未初始化");
+        return t;
+    }
+
+    cv::Mat frame;
+    if(!g_stream->wait(frame, 200)){      // ★ 相机线程的最新帧；没新帧最多等 200ms
+        RCLCPP_ERROR(LOGGER, "视觉: 200ms 内没有新图");
+        return t;
+    }
+
+    const CarTargetPose r = solveCarTargetPose(frame, g_pnp_data);
+    if(!r.ok){
+        RCLCPP_ERROR(LOGGER, "视觉解算失败: %s", r.reason.c_str());
+        return t;
+    }
+
+    const cv::Vec6d pose6 = r[0];   // 0~5: x,y,z,roll,pitch,yaw
+    const cv::Vec3d vec3  = r[1];   // 6~8: 目标向量
+
+    t.p   = Eigen::Vector3d(pose6[0], pose6[1], pose6[2]) / 1000.0;  // mm -> m
+    t.rpy = Eigen::Vector3d(pose6[3], pose6[4], pose6[5]);           // rad
+    t.v   = Eigen::Vector3d(vec3[0], vec3[1], vec3[2]);
+    t.err = r.errMeanPx;
+    t.ok  = true;
     return t;
 }
 
@@ -1098,27 +1233,29 @@ static bool build_plan_(PlanKind kind, std::vector<std::vector<float> >& traj){
         case PlanKind::STEP_APPROACH: {
             const VisionTarget vt = vision_locate();
             if(!vt.ok)return false;
-            const float pose[6] = {(float)vt.pose.x(), (float)vt.pose.y(), (float)vt.pose.z(),
-                                   (float)vt.rpy.x(), (float)vt.rpy.y(), (float)vt.rpy.z()};
-            const Eigen::Isometry3d goal = pose_to_isometry(pose);
-            RCLCPP_INFO(LOGGER, "步骤1 接近: 目标=(%.3f, %.3f, %.3f) rpy=(%.1f, %.1f, %.1f)度",
-                        vt.pose.x(), vt.pose.y(), vt.pose.z(),
-                        vt.rpy.x() * rad2deg, vt.rpy.y() * rad2deg, vt.rpy.z() * rad2deg);
+            Eigen::Isometry3d goal = cur;
+            goal.translation() = vt.p;
+            // 姿态用视觉给出的 rpy：R = Rz(yaw) * Ry(pitch) * Rx(roll)
+            goal.linear() = (Eigen::AngleAxisd(vt.rpy[2], Eigen::Vector3d::UnitZ())
+                           * Eigen::AngleAxisd(vt.rpy[1], Eigen::Vector3d::UnitY())
+                           * Eigen::AngleAxisd(vt.rpy[0], Eigen::Vector3d::UnitX())).toRotationMatrix();
+            RCLCPP_INFO(LOGGER, "步骤1 接近: 目标=(%.3f, %.3f, %.3f) rpy=(%.1f, %.1f, %.1f)度 err=%.2fpx",
+                        vt.p.x(), vt.p.y(), vt.p.z(),
+                        vt.rpy[0] * rad2deg, vt.rpy[1] * rad2deg, vt.rpy[2] * rad2deg, vt.err);
             traj = best_plan_(goal);
             return !traj.empty();
         }
         case PlanKind::STEP_INSERT:
         case PlanKind::STEP_SHIFT: {
             const bool insert = (kind == PlanKind::STEP_INSERT);
-            const VisionTarget vt = vision_locate();
-            if(!vt.ok)return false;
+            const Eigen::Vector3d dir = (insert ? STEP_INSERT_DIR : STEP_SHIFT_DIR).normalized();
+            const double dist = insert ? STEP_INSERT_DIST : STEP_SHIFT_DIST;
             Eigen::Isometry3d goal = cur;
-            goal.translation() += vt.delta;
+            goal.translation() += dir * dist;
             std::vector<Eigen::Isometry3d> waypoints;
             waypoints.push_back(cur);
             waypoints.push_back(goal);
-            RCLCPP_INFO(LOGGER, "步骤%d %s: 增量=(%.3f, %.3f, %.3f) 目标=(%.3f, %.3f, %.3f)", insert ? 2 : 3, insert ? "插入" : "平移",
-                        vt.delta.x(), vt.delta.y(), vt.delta.z(),
+            RCLCPP_INFO(LOGGER, "步骤%d %s: 目标=(%.3f, %.3f, %.3f)", insert ? 2 : 3, insert ? "插入" : "平移",
                         goal.translation().x(), goal.translation().y(), goal.translation().z());
             traj = cartesian_plan_(waypoints);
             if(traj.empty())return false;
@@ -1128,18 +1265,13 @@ static bool build_plan_(PlanKind kind, std::vector<std::vector<float> >& traj){
         case PlanKind::STEP_ROT_P:
         case PlanKind::STEP_ROT_Q: {
             const bool rot_p = (kind == PlanKind::STEP_ROT_P);
-            const VisionTarget vt = vision_locate();
-            if(!vt.ok)return false;
-            if(!vt.axis_point.allFinite() || !vt.axis_dir.allFinite() || vt.axis_dir.norm() < 1e-6){
-                RCLCPP_ERROR(LOGGER, "步骤%d 旋转: 视觉给出的旋转轴无效", rot_p ? 4 : 5);
-                return false;
-            }
-            const Eigen::Vector3d axis_dir = vt.axis_dir.normalized();
-            const int N = arc_segments(vt.theta);
-            auto waypoints = arc_waypoints_(vt.axis_point, axis_dir, vt.theta, cur, N);
-            RCLCPP_INFO(LOGGER, "步骤%d 旋转: 轴点=(%.3f, %.3f, %.3f) 轴=(%.2f, %.2f, %.2f) 角度=%.1f度", rot_p ? 4 : 5,
-                        vt.axis_point.x(), vt.axis_point.y(), vt.axis_point.z(),
-                        axis_dir.x(), axis_dir.y(), axis_dir.z(), vt.theta * rad2deg);
+            const Eigen::Vector3d axis_dir = (rot_p ? STEP_ROT_P_AXIS : STEP_ROT_Q_AXIS).normalized();
+            const double theta = rot_p ? STEP_ROT_P_THETA : STEP_ROT_Q_THETA;
+            const int N = arc_segments(theta);
+            // 旋转中心暂取当前末端位置（真实P/Q轴需视觉或标定给出）
+            auto waypoints = arc_waypoints_(cur.translation(), axis_dir, theta, cur, N);
+            RCLCPP_INFO(LOGGER, "步骤%d 旋转: 轴=(%.2f, %.2f, %.2f) 角度=%.1f度", rot_p ? 4 : 5,
+                        axis_dir.x(), axis_dir.y(), axis_dir.z(), theta * rad2deg);
             traj = cartesian_plan_(waypoints);
             if(traj.empty())return false;
             check_traj(traj, waypoints, rot_p ? "STEP4" : "STEP5");
@@ -1227,12 +1359,12 @@ static void planning_thread_func(){
                     fail_and_idle("规划失败");
                     break;
                 }
-                if(g_abort_stream.load()){      // 规划期间被0x0D取消
+                if(g_abort_stream.load()){      // 规划期间被0x06取消
                     abort_to_idle();
                     break;
                 }
                 send_trajectory(traj);
-                if(g_abort_stream.load()){      // 下发期间被0x0D取消
+                if(g_abort_stream.load()){      // 下发期间被0x06取消
                     abort_to_idle();
                     break;
                 }
@@ -1242,7 +1374,7 @@ static void planning_thread_func(){
                 break;
             }
             case State::EXECUTING:{
-                if(g_abort_stream.load()){      // 0x0D 打断：维持当前位姿
+                if(g_abort_stream.load()){      // 0x06 打断：维持当前位姿
                     abort_to_idle();
                     break;
                 }
@@ -1284,14 +1416,14 @@ static void planning_thread_func(){
                         (Ta.translation() - Tc.translation()).norm() * 1000.0,
                         Eigen::AngleAxisd(Ta.linear().transpose() * Tc.linear()).angle() * rad2deg);
                     g_arrived_cnt = 0;
-                    // 单步指令才回 0x0C，下位机据此推进下一步；手动调试入口不回
+                    // 单步指令才回 0x0A，下位机据此推进下一步；手动调试入口不回
                     const int step = (int)g_exec_kind;
                     if(step >= (int)PlanKind::STEP_APPROACH && step <= (int)PlanKind::STEP_ROT_Q){
                         protocal::StepDone done;
                         done.cmd = protocal::Cmd::STEP_DONE;
                         done.step = (uint16_t)step;
                         send_frame((uint8_t*)&done, sizeof(done));
-                        RCLCPP_INFO(LOGGER, "步骤%d 完成, 已回 0x0C", step);
+                        RCLCPP_INFO(LOGGER, "步骤%d 完成, 已回 0x0A", step);
                     }
                     g_state = State::IDLE;
                     RCLCPP_INFO(LOGGER, "执行完成, 回到 IDLE");
@@ -1373,6 +1505,21 @@ int main(int argc, char** argv){
         RCLCPP_FATAL(LOGGER, "MoveIt 初始化失败");
         return 1;
     }
+    // ★ 开相机 + 起相机内部取帧线程（失败直接退出，避免跑起来没视觉）
+    if(!vision_init()){
+        RCLCPP_FATAL(LOGGER, "相机初始化失败");
+        close_serial();
+        rclcpp::shutdown();
+        return 1;
+    }
+
+    // ★ 解算接口：拿到 6 自由度 + 3 维向量（不打印）
+    const VisionTarget vt0 = vision_locate();
+    if(!vt0.ok){
+        RCLCPP_WARN(LOGGER, "视觉自检: 未解出目标，收到 0x01 时会重试");
+    }
+    // vt[0] → 六自由度；vt[1] → 三自由度量
+
     RCLCPP_INFO(LOGGER, "系统就绪, 等待请求...");
 
     // 启动串口线程和规划线程
@@ -1386,6 +1533,7 @@ int main(int argc, char** argv){
     RCLCPP_INFO(LOGGER, "正在关闭...");
     g_running = false;
     g_state = State::IDLE;
+    vision_shutdown();      // ★ 先停相机：唤醒可能阻塞在 wait() 里的规划线程
     close_serial();
     serial_thr.join();
     plan_thr.join();

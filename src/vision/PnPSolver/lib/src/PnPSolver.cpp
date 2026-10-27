@@ -658,20 +658,6 @@ CarTarget solveCarTargetFromCorners(const std::vector<cv::Point2f> &points2D,
     return poseImpl(points2D, data, opt);
 }
 
-CarTarget solveCarTarget(const cv::Mat &bgrFrame, const PnPDate &data,
-                         const CarTargetOptions &opt)
-{
-    std::vector<cv::Point2f> points2D;
-    std::string reason;
-    if (!detectImpl(bgrFrame, points2D, &reason))
-    {
-        CarTarget out;
-        out.reason = reason;
-        return out;
-    }
-    return poseImpl(points2D, data, opt);
-}
-
 // ============================================================================
 //  CarTargetItem / CarTargetPose：两级索引 + 姿态换算 + 6 自由度封包
 // ============================================================================
@@ -759,7 +745,15 @@ CarTargetPose toCarTargetPose(const CarTarget &t)
 CarTargetPose solveCarTargetPose(const cv::Mat &bgrFrame, const PnPDate &data,
                                  const CarTargetOptions &opt)
 {
-    return toCarTargetPose(solveCarTarget(bgrFrame, data, opt));
+    std::vector<cv::Point2f> points2D;
+    std::string reason;
+    if (!detectImpl(bgrFrame, points2D, &reason))
+    {
+        CarTargetPose out;
+        out.reason = reason;
+        return out;
+    }
+    return toCarTargetPose(poseImpl(points2D, data, opt));
 }
 
 // ============================================================================

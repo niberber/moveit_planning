@@ -24,11 +24,6 @@
 //      X 轴 = 与装甲板系 X 同向
 //      Y 轴 = 与装甲板系 Y 反向
 //    数学上：R_target_in_car = R_armor_in_car * diag(1, -1, 1)
-//
-//  旧接口（只关心目标点和向量时用）：
-//      CarTarget t = solveCarTarget(frame, data);
-//      t.point;   // 目标点  (mm, 车体系)
-//      t.vec;     // 目标向量      (车体系)
 // ============================================================================
 #pragma once
 
@@ -139,12 +134,7 @@ CarTargetPose solveCarTargetPose(const cv::Mat &bgrFrame, const PnPDate &data,
 CarTargetPose toCarTargetPose(const CarTarget &t);
 
 // ----------------------------------------------------------------------------
-//  ★ 主函数：一帧图像 -> 车体系下的目标点 + 目标向量
-// ----------------------------------------------------------------------------
-CarTarget solveCarTarget(const cv::Mat &bgrFrame, const PnPDate &data,
-                         const CarTargetOptions &opt = CarTargetOptions());
 
-// ----------------------------------------------------------------------------
 //  分步接口（一般用不到）
 // ----------------------------------------------------------------------------
 
@@ -161,7 +151,7 @@ CarTarget solveCarTargetFromCorners(const std::vector<cv::Point2f> &points2D,
 //
 //      PnPTuner tuner;
 //      while (cap.read(frame)) {
-//          const CarTarget t = tuner.add(frame, data);   // 等价 solveCarTarget
+//          const CarTarget t = tuner.add(frame, data);   // 等价 solveCarTargetPose
 //          printf("%.2f px\n", t.errMeanPx);
 //          if (cv::waitKey(1) == 27) break;
 //      }

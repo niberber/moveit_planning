@@ -81,7 +81,7 @@ int main()
 //
 // 2) 上位机侧新增薄封装（建议新文件 src/vision_target.cpp，约50行）
 //    - 取帧源二选一，用文件顶部常量切换：cv::VideoCapture(VISION_CAM_INDEX) 或读视频；
-//    - 连续取帧调 solveCarTarget(frame, data, opt)，只累计 errMeanPx < 2.0 的好帧；
+//    - 连续取帧调 solveCarTargetPose(frame, data, opt)，只累计 errMeanPx < 2.0 的好帧；
 //    - 取够 N=5 帧后平均 point 与 R（R 用四元数平均再转回矩阵），point/1000 得到 m，
 //      填 VisionTarget{p, R, ok, err}；
 //    - 超时(如500ms)无好帧则返回 ok=false，状态机会自动回 0x08。
