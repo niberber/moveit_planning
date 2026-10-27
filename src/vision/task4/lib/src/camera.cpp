@@ -67,7 +67,9 @@ namespace
         switch (info.enPixelType)
         {
         case PixelType_Gvsp_BayerRG8:
-            cv::cvtColor(src1(), out, cv::COLOR_BayerRG2BGR);
+            // 实测该相机上报 BayerRG8 但实际相位是 BG，按 RG 转会导致红蓝互换
+            // （红色灯条在画面里显示成蓝色 → PnPSolver 的红色阈值检不到），故用 BG 相位
+            cv::cvtColor(src1(), out, cv::COLOR_BayerBG2BGR);
             return true;
         case PixelType_Gvsp_BayerGB8:
             cv::cvtColor(src1(), out, cv::COLOR_BayerGB2BGR);
