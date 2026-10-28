@@ -50,12 +50,11 @@ namespace
         return path;
     }
 
-    // 把 SDK 输出的一帧统一转成 RGB 三通道的 cv::Mat（out 自己持有内存，
+    // 把 SDK 输出的一帧转成 BGR 三通道的 cv::Mat（out 自己持有内存，
     // 调用方随后 FreeImageBuffer 也不会影响它）。
-    // ★ 对外约定的颜色顺序是 RGB：送神经网络推理可以直接用。
-    //   但 OpenCV 的 imshow/imwrite/COLOR_x2HSV 都按 BGR 解释，
-    //   所以 PnPSolver 的调用处要自己转一次 COLOR_RGB2BGR，否则检不到光条。
-    bool to_rgb(const MV_FRAME_OUT_INFO_EX &info, const void *data, cv::Mat &out)
+    // ★ 注意：Bayer RG 转出来必须是 BGR，不能是 RGB，
+    //   PnPSolver 内部按 COLOR_BGR2HSV 做颜色阈值，通道一反就检不到光条。
+    bool to_bgr(const MV_FRAME_OUT_INFO_EX &info, const void *data, cv::Mat &out)
     {
         const int w = static_cast<int>(info.nWidth);
         const int h = static_cast<int>(info.nHeight);
@@ -68,25 +67,27 @@ namespace
         switch (info.enPixelType)
         {
         case PixelType_Gvsp_BayerRG8:
-            cv::cvtColor(src1(), out, cv::COLOR_BayerRG2RGB);
+            // 实测该相机上报 BayerRG8 但实际相位是 BG，按 RG 转会导致红蓝互换
+            // （红色灯条在画面里显示成蓝色 → PnPSolver 的红色阈值检不到），故用 BG 相位
+            cv::cvtColor(src1(), out, cv::COLOR_BayerBG2BGR);
             return true;
         case PixelType_Gvsp_BayerGB8:
-            cv::cvtColor(src1(), out, cv::COLOR_BayerGB2RGB);
+            cv::cvtColor(src1(), out, cv::COLOR_BayerGB2BGR);
             return true;
         case PixelType_Gvsp_BayerGR8:
-            cv::cvtColor(src1(), out, cv::COLOR_BayerGR2RGB);
+            cv::cvtColor(src1(), out, cv::COLOR_BayerGR2BGR);
             return true;
         case PixelType_Gvsp_BayerBG8:
-            cv::cvtColor(src1(), out, cv::COLOR_BayerBG2RGB);
+            cv::cvtColor(src1(), out, cv::COLOR_BayerBG2BGR);
             return true;
         case PixelType_Gvsp_RGB8_Packed:
-            out = src3().clone(); // 本身就是 RGB，不用换序
+            cv::cvtColor(src3(), out, cv::COLOR_RGB2BGR);
             return true;
         case PixelType_Gvsp_BGR8_Packed:
-            cv::cvtColor(src3(), out, cv::COLOR_BGR2RGB);
+            out = src3().clone();
             return true;
         case PixelType_Gvsp_Mono8:
-            cv::cvtColor(src1(), out, cv::COLOR_GRAY2RGB);
+            cv::cvtColor(src1(), out, cv::COLOR_GRAY2BGR);
             return true;
         default:
             return false;
@@ -236,15 +237,11 @@ void CameraControl::start_streaming()
 // 按下 ESC 返回 false（结束采集）；按下 Q/q 把当前帧保存到 images/ 目录
 bool CameraControl::img_collection_free_buffer()
 {
-    // 取帧 + 转 RGB 都在 grab() 里完成，这里只负责显示和按键
-    if (!grab(m_rgb))
+    // 取帧 + 转 BGR 都在 grab() 里完成，这里只负责显示和按键
+    if (!grab(m_bgr))
         return false;
 
-    // imshow/imwrite 按 BGR 解释，显示和存盘前转一次
-    cv::Mat bgr;
-    cv::cvtColor(m_rgb, bgr, cv::COLOR_RGB2BGR);
-
-    cv::imshow("Camera", bgr);
+    cv::imshow("Camera", m_bgr);
     const int key = cv::waitKey(1) & 0xFF;
 
     if (key == 27) // ESC 退出
@@ -254,7 +251,7 @@ bool CameraControl::img_collection_free_buffer()
 
     if (key == 'q' || key == 'Q') // Q/q 保存图片
     {
-        const std::string path = save_image(bgr, "images");
+        const std::string path = save_image(m_bgr, "images");
         if (!path.empty())
         {
             std::cout << "Image saved: " << path << std::endl;
@@ -264,7 +261,7 @@ bool CameraControl::img_collection_free_buffer()
     return true;
 }
 
-// 只取一帧：GetImageBuffer -> 转 RGB -> FreeImageBuffer
+// 只取一帧：GetImageBuffer -> 转 BGR -> FreeImageBuffer
 // 全程不碰显示/按键，所以可以放在后台线程里反复调用
 bool CameraControl::grab(cv::Mat &out)
 {
@@ -287,7 +284,7 @@ bool CameraControl::grab(cv::Mat &out)
     m_lastGrabErr = MV_OK;
 
     const unsigned int pixelType = stOutFrame.stFrameInfo.enPixelType;
-    const bool ok = to_rgb(stOutFrame.stFrameInfo, stOutFrame.pBufAddr, out);
+    const bool ok = to_bgr(stOutFrame.stFrameInfo, stOutFrame.pBufAddr, out);
 
     // 释放相机缓存，之后 pBufAddr 失效；out 已由 cvtColor/clone 分配了独立内存
     const int nRet = MV_CC_FreeImageBuffer(m_handle, &stOutFrame);
