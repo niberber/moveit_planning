@@ -4,9 +4,43 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 namespace
 {
+
+// ============================================================================
+//  调试输出：只有环境变量 PNP_DEBUG 非空且不为 "0" 时才打印，默认完全静默
+//  （本库在相机线程里逐帧调用，无条件打印会把终端刷爆）
+// ============================================================================
+bool debugOn()
+{
+    static const bool on = []
+    {
+        const char *v = std::getenv("PNP_DEBUG");
+        return v != nullptr && *v != '\0' && std::string(v) != "0";
+    }();
+    return on;
+}
+
+// 一次检测的统计量；析构时打印一行，提前 return 也能打出当前进度
+struct DetectTrace
+{
+    const bool on = debugOn();
+    size_t contours = 0; // findContours 得到的原始轮廓数
+    size_t usable = 0;   // 点数够、参与梯度取景的轮廓数
+    size_t bars = 0;     // 成功提取出 4 个角点的光条数
+    double spacing = -1; // 两光条质心间距 (px)，-1 表示尚未计算
+    const char *result = "未完成";
+
+    ~DetectTrace()
+    {
+        if (!on)
+            return;
+        std::fprintf(stderr, "[PnP] 轮廓=%zu 可用=%zu 光条=%zu 间距=%.0fpx -> %s\n",
+                     contours, usable, bars, spacing, result);
+    }
+};
 
 // ============================================================================
 //  固定的算法参数（要调就改这里）
@@ -423,10 +457,12 @@ bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
                 std::string *reason)
 {
     points2D.clear();
+    DetectTrace trace;
     if (bgrFrame.empty())
     {
         if (reason)
             *reason = "输入帧为空";
+        trace.result = "输入帧为空";
         return false;
     }
 
@@ -437,6 +473,7 @@ bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
     // 那样直边方向直方图里几乎没有点可统计
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+    trace.contours = contours.size();
 
     // ---- 梯度只在轮廓包围盒内计算 ----
     // 整帧算 Sobel×2 + magnitude + phase 约占整条检测链 50% 的时间，
@@ -448,6 +485,7 @@ bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
     {
         if (static_cast<int>(c.size()) < kMinContourPoints)
             continue; // 噪点轮廓不参与取景，也省掉后面的无效计算
+        ++trace.usable;
         const cv::Rect r = cv::boundingRect(c);
         gradRoi = (gradRoi.area() == 0) ? r : (gradRoi | r);
     }
@@ -455,6 +493,7 @@ bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
     {
         if (reason)
             *reason = "没有有效轮廓";
+        trace.result = "没有有效轮廓";
         return false;
     }
     gradRoi = cv::Rect(gradRoi.x - kGradMargin, gradRoi.y - kGradMargin,
@@ -484,11 +523,13 @@ bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
         if (extractBarCorners(contour, mag, angle, gradRoi.tl(), b.pts, b.cx))
             bars.push_back(b);
     }
+    trace.bars = bars.size();
 
     if (bars.size() != 2)
     {
         if (reason)
             *reason = "有效光条数 = " + std::to_string(bars.size()) + "（需要 2）";
+        trace.result = "光条数不足";
         return false;
     }
 
@@ -499,12 +540,17 @@ bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
 
     if (bars[1].cx - bars[0].cx < kMinBarSpacingPx)
     {
+        trace.spacing = bars[1].cx - bars[0].cx;
         if (reason)
             *reason = "两光条质心间距只有 " +
                       std::to_string(static_cast<int>(bars[1].cx - bars[0].cx)) +
                       " px，左右布局不成立";
+        trace.result = "间距过小";
         return false;
     }
+
+    trace.spacing = bars[1].cx - bars[0].cx;
+    trace.result = "OK";
 
     points2D.reserve(8);
     for (const auto &b : bars)
@@ -720,16 +766,15 @@ CarTargetPose toCarTargetPose(const CarTarget &t)
     if (!t.ok)
         return out;
 
-    // 目标系 = 装甲板系绕自身 Z 轴转 180°：
-    //   R_target_in_car = R_armor_in_car * diag(-1, -1, 1)
-    // 右乘后只改前两列（X、Y 同时反向），Z 列（板法线/接近方向）保持不变，
-    // det 仍为 +1，所以仍是合法旋转。
-    // ★ 不能只反 Y：diag(1,-1,1) 的 det = -1，会把目标系变成左手系（镜像），
-    //   rpyFromR 解出来的欧拉角就不再对应真实姿态。
-    const cv::Matx33d kFlipXY(-1, 0, 0,
-                               0, -1, 0,
-                               0,  0, 1);
-    out.R = t.R_armor_to_car * kFlipXY;
+    // 目标系 = 装甲板系把 Y 轴取反：
+    //   R_target_in_car = R_armor_in_car * diag(1, -1, 1)
+    // 右乘 diag(1,-1,1) 的效果就是"只把旋转矩阵第 2 列取反"。
+    // ★ 它自身的 det = -1，和 CarTargetOptions::R_car_from_cam（det 也是 -1）配对，
+    //   相乘后 out.R 的 det 为 +1，才是 rpyFromR 能接受的纯旋转。
+    const cv::Matx33d kFlipY(1, 0, 0,
+                             0, -1, 0,
+                             0, 0, 1);
+    out.R = t.R_armor_to_car * kFlipY;
 
     // 平移部分：目标系原点就是目标点本身
     out.pose[0] = t.point[0];
