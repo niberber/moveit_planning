@@ -69,8 +69,8 @@ struct CarTargetOptions
                                                0, 0,  1,
                                                0, -1, 0);
     // 车体原点 -> 相机光心 (mm)，顺序与车体系 (x, y, z) 一致：
-    // 左 72.83 / 前 492.4 / 上 726.45
-    cv::Vec3d t_cam_in_car = cv::Vec3d(72.83, 492.4, 726.45);
+    // 左 72.83 / 后 492.4 / 上 726.45（y 轴朝前，取负表示光心在原点后方）
+    cv::Vec3d t_cam_in_car = cv::Vec3d(72.83, -492.4, 726.45);
 
     bool refineWithLM = false; // IPPE 之后再做一步 LM 精修
 };
