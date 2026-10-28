@@ -20,8 +20,8 @@ private:
     // 上一次取帧的错误码，只在错误码变化时打印，避免断线时刷屏
     int m_lastGrabErr = 0;
 public:
-    //用于神经网络推理的图像，以及后续展示图像（BGR 三通道）
-    cv::Mat m_bgr;
+    //用于神经网络推理的图像，以及后续展示图像（RGB 三通道）
+    cv::Mat m_rgb;
 
     // 禁止拷贝构造和赋值
     CameraControl(const CameraControl &) = delete;
@@ -61,9 +61,10 @@ public:
     // 按 Q/q 将当前帧保存为 images/ 目录下带时间戳的 png
     bool img_collection_free_buffer();
 
-    // ★ 只取一帧并转成 BGR 三通道的 cv::Mat（不显示、不保存、不碰 GUI）
+    // ★ 只取一帧并转成 RGB 三通道的 cv::Mat（不显示、不保存、不碰 GUI）
     //   成功返回 true；1s 超时、句柄无效、像素格式不支持都返回 false。
-    //   出帧顺序严格是 BGR，与 PnPSolver::solveCarTargetPose() 的输入约定一致。
+    //   出帧顺序严格是 RGB：送神经网络可直接用；而 PnPSolver::solveCarTargetPose()
+    //   内部按 BGR 处理（COLOR_BGR2HSV），调用处要自己转一次 COLOR_RGB2BGR。
     //   这个函数是线程安全的用法前提：在后台线程里循环调用（见 CameraStream）。
     bool grab(cv::Mat &out);
 
@@ -148,10 +149,12 @@ public:
 //          cv::Mat frame;
 //          if (stream.latest(frame))        // ★ 有新帧才进来，非阻塞
 //          {
-//              CarTargetPose r = solveCarTargetPose(frame, data);
+//              cv::Mat bgr;
+//              cv::cvtColor(frame, bgr, cv::COLOR_RGB2BGR);  // ★ 出帧是 RGB
+//              CarTargetPose r = solveCarTargetPose(bgr, data);
 //              if (r.ok) { cv::Vec6d p6 = r[0]; cv::Vec3d p3 = r[1]; }
+//              cv::imshow("PnP", bgr);      // imshow/waitKey 必须在主线程
 //          }
-//          cv::imshow("PnP", frame);        // imshow/waitKey 必须在主线程
 //          if (cv::waitKey(1) == 27) break;
 //      }
 //
@@ -163,6 +166,8 @@ public:
 //    - 相机线程只负责取图；imshow / waitKey / 解算 / 规划都留在主线程。
 //    - latest() 拿到的是 cv::Mat 的浅拷贝（只加引用计数）。之后相机线程覆盖
 //      缓存里的 latest_ 不会影响你已经取走的那一帧，所以解算期间不需要加锁。
+//    - 帧是 RGB；OpenCV 的 imshow/imwrite 和 PnPSolver 都按 BGR 解释，
+//      用之前自己转一次 COLOR_RGB2BGR。
 //    - 析构函数会自动 stop()，但 CameraControl 必须在 stream 之后销毁
 //      （即先 stream.stop()，再让 cam 出作用域）。
 // ============================================================================
@@ -189,7 +194,7 @@ public:
     // 阻塞：最多等 timeoutMs 毫秒，等到新帧返回 true
     bool wait(cv::Mat &out, int timeoutMs = 200);
 
-    // ★ 每帧回调：在【相机线程】里调用，参数是最新帧（BGR）
+    // ★ 每帧回调：在【相机线程】里调用，参数是最新帧（RGB）
     //   用途：在采集线程里直接做解算/统计，主线程只取结果。
     //   注意：
     //     1) 回调里不要做 GUI（imshow/waitKey）；

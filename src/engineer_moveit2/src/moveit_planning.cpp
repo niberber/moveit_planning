@@ -1136,8 +1136,12 @@ struct VisionTarget{
 // ★ 相机线程里的每帧回调：解算 + 打印重投影误差 + 定期给三维坐标修正建议
 static void vision_on_frame(const cv::Mat &frame)
 {
+    // 相机出帧是 RGB，PnPTuner 内部按 BGR 做 COLOR_BGR2HSV，这里转一次
+    cv::Mat bgr;
+    cv::cvtColor(frame, bgr, cv::COLOR_RGB2BGR);
+
     // PnPTuner::add() 内部完成检测+解算，并累计每个 3D 点的偏差
-    const CarTarget t = g_pnp_tuner.add(frame, g_pnp_data);
+    const CarTarget t = g_pnp_tuner.add(bgr, g_pnp_data);
     if(!t.ok){
         RCLCPP_WARN_THROTTLE(LOGGER, *g_node->get_clock(), 2000,
                              "视觉解算失败: %s", t.reason.c_str());
@@ -1209,7 +1213,11 @@ static VisionTarget vision_locate()
         return t;
     }
 
-    const CarTargetPose r = solveCarTargetPose(frame, g_pnp_data);
+    // ★ 相机出帧是 RGB，PnPSolver 内部按 BGR 做 COLOR_BGR2HSV，这里转一次
+    cv::Mat bgr;
+    cv::cvtColor(frame, bgr, cv::COLOR_RGB2BGR);
+
+    const CarTargetPose r = solveCarTargetPose(bgr, g_pnp_data);
     if(!r.ok){
         RCLCPP_ERROR(LOGGER, "视觉解算失败: %s", r.reason.c_str());
         return t;

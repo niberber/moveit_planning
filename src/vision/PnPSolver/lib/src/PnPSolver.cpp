@@ -720,14 +720,16 @@ CarTargetPose toCarTargetPose(const CarTarget &t)
     if (!t.ok)
         return out;
 
-    // 目标系 = 装甲板系把 Y 轴取反：
-    //   R_target_in_car = R_armor_in_car * diag(1, -1, 1)
-    // 右乘 diag(1,-1,1) 的效果就是"只把旋转矩阵第 2 列取反"，
-    // X、Z 两轴方向不变，det 仍为 +1，所以仍然是一个合法旋转。
-    const cv::Matx33d kFlipY(1, 0, 0,
-                             0, -1, 0,
-                             0, 0, 1);
-    out.R = t.R_armor_to_car * kFlipY;
+    // 目标系 = 装甲板系绕自身 Z 轴转 180°：
+    //   R_target_in_car = R_armor_in_car * diag(-1, -1, 1)
+    // 右乘后只改前两列（X、Y 同时反向），Z 列（板法线/接近方向）保持不变，
+    // det 仍为 +1，所以仍是合法旋转。
+    // ★ 不能只反 Y：diag(1,-1,1) 的 det = -1，会把目标系变成左手系（镜像），
+    //   rpyFromR 解出来的欧拉角就不再对应真实姿态。
+    const cv::Matx33d kFlipXY(-1, 0, 0,
+                               0, -1, 0,
+                               0,  0, 1);
+    out.R = t.R_armor_to_car * kFlipXY;
 
     // 平移部分：目标系原点就是目标点本身
     out.pose[0] = t.point[0];

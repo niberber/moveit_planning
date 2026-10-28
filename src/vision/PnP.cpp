@@ -99,7 +99,8 @@ int main()
 //    但 `colcon build --packages-select PnP` 仍会因"没有 install 目标"告警，属既有问题。
 //
 // 5) 坐标系与单位约定（接入前必须对齐）
-//    - 视觉输出的 car 系即 base_link；t_cam_in_car=(492.4,726.45,72.83)mm 为相机装配值；
+//    - 视觉输出的 car 系即 base_link，轴向与 CAD 全局系同向：x 左 / y 上 / z 前；
+//      t_cam_in_car=(72.83,726.45,492.4)mm 为相机装配值（左 / 上 / 前）；
 //    - 视觉内部全程 mm，MoveIt/Eigen 全程 m，只在 vision_locate() 出口换算一次；
 //    - 步骤2 插入方向优先用视觉给的 vec（换到 base_link 后取反向），当前用 STEP_INSERT_DIR 代替；
 //      步骤3/4/5 同理，P/Q 轴待标定或视觉给出，对应的常量在文件顶部。
