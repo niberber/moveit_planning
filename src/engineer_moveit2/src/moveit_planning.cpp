@@ -73,6 +73,10 @@ static const Eigen::Vector3d STEP_ROT_P_AXIS(1.0, 0.0, 0.0);  // 步骤4：P轴�
 static const double STEP_ROT_P_THETA = 90.0 * deg2rad;        // 向上90°
 static const Eigen::Vector3d STEP_ROT_Q_AXIS(0.0, 1.0, 0.0);  // 步骤5：Q轴方向（待视觉/标定给出）
 static const double STEP_ROT_Q_THETA = 90.0 * deg2rad;        // 指定角（待规则/标定给出）
+
+// 真实插入点相对 TCP 原点(link11)的偏移，base_link 系，单位 m（插入点在 TCP 下方）
+// 视觉返回的 p 是插入点，规划下发的是 TCP 原点 → TCP目标 = 插入点 - 该偏移
+static const Eigen::Vector3d INSERT_POINT_OFFSET_IN_BASE(0.0, 0.04369, -0.08758);
 #define FEEDBACK_TIMEOUT_MS 1000             // 反馈超过该时长未更新则拒绝规划
 
 // 指令号分配：STM32->PC 用 0x01~0x06 与 0x0D；PC->STM32 用 0x07~0x0C
@@ -177,7 +181,7 @@ static uint16_t crc16(const uint8_t* data, size_t len){
 }
 
 static rclcpp::Node::SharedPtr g_node;
-static std::string g_serial_port = "/dev/ttyUSB1";
+static std::string g_serial_port = "/dev/ttyUSB0";
 static int g_serial_fd = -1;
 
 // 状态机状态
@@ -1117,7 +1121,7 @@ static void start_execution(const std::vector<std::vector<float> >& traj){
 // ==================== 视觉接口：海康相机 + PnP ====================
 // 相机参数（按现场调整）
 static const int VISION_CAM_INDEX   = 0;      // 相机序列索引（枚举到的第几台）
-static const int VISION_EXPOSURE_US = 8000;   // 曝光时间(us)
+static const int VISION_EXPOSURE_US = 2000;   // 曝光时间(us)
 static const int VISION_GAIN_DB     = 15;     // 信号放大增益(dB)
 static const int VISION_BUFFER_NUM  = 2;      // 图像缓存节点数
 
@@ -1302,13 +1306,15 @@ static bool build_plan_(PlanKind kind, std::vector<std::vector<float> >& traj){
                 return false;
             }
             Eigen::Isometry3d goal = cur;
-            goal.translation() = vision_target.p;
+            // 视觉给的是插入点，下发的是 TCP 原点：把目标点从插入点换算到 TCP
+            goal.translation() = vision_target.p - INSERT_POINT_OFFSET_IN_BASE;
             // 姿态用视觉给出的 rpy：R = Rz(yaw) * Ry(pitch) * Rx(roll)
             goal.linear() = (Eigen::AngleAxisd(vision_target.rpy[2], Eigen::Vector3d::UnitZ())
                            * Eigen::AngleAxisd(vision_target.rpy[1], Eigen::Vector3d::UnitY())
                            * Eigen::AngleAxisd(vision_target.rpy[0], Eigen::Vector3d::UnitX())).toRotationMatrix();
-            RCLCPP_INFO(LOGGER, "步骤1 接近: 目标=(%.3f, %.3f, %.3f) rpy=(%.4f, %.4f, %.4f) rad err=%.2fpx",
+            RCLCPP_INFO(LOGGER, "步骤1 接近: 插入点=(%.3f, %.3f, %.3f) TCP目标=(%.3f, %.3f, %.3f) rpy=(%.4f, %.4f, %.4f) rad err=%.2fpx",
                         vision_target.p.x(), vision_target.p.y(), vision_target.p.z(),
+                        goal.translation().x(), goal.translation().y(), goal.translation().z(),
                         vision_target.rpy[0], vision_target.rpy[1], vision_target.rpy[2], vision_target.err);
             traj = best_plan_(goal);
             return !traj.empty();
@@ -1327,8 +1333,11 @@ static bool build_plan_(PlanKind kind, std::vector<std::vector<float> >& traj){
             std::vector<Eigen::Isometry3d> waypoints;
             waypoints.push_back(cur);
             waypoints.push_back(goal);
-            RCLCPP_INFO(LOGGER, "步骤%d %s: 增量=(%.3f, %.3f, %.3f) 目标=(%.3f, %.3f, %.3f) err=%.2fpx", insert ? 2 : 3, insert ? "插入" : "平移",
+            RCLCPP_INFO(LOGGER, "步骤%d %s: 增量=(%.3f, %.3f, %.3f) 插入点=(%.3f, %.3f, %.3f) TCP目标=(%.3f, %.3f, %.3f) err=%.2fpx", insert ? 2 : 3, insert ? "插入" : "平移",
                         delta.x(), delta.y(), delta.z(),
+                        goal.translation().x() + INSERT_POINT_OFFSET_IN_BASE.x(),
+                        goal.translation().y() + INSERT_POINT_OFFSET_IN_BASE.y(),
+                        goal.translation().z() + INSERT_POINT_OFFSET_IN_BASE.z(),
                         goal.translation().x(), goal.translation().y(), goal.translation().z(), vision_target.err);
             traj = cartesian_plan_(waypoints);
             if(traj.empty()){
