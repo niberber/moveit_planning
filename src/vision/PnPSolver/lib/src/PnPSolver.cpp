@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 
@@ -45,10 +48,10 @@ struct DetectTrace
 // ============================================================================
 //  固定的算法参数（要调就改这里）
 // ============================================================================
-const cv::Scalar kHsvLow(0, 174, 49); // 二值化下限
-const cv::Scalar kHsvHigh(43, 255, 255);
-const int kMorphKernel = 5; // 闭运算核（MORPH_ELLIPSE）
-const int kBlurKernel = 5;  // 高斯核
+// 红蓝通道相减二值化的差分阈值：运行时用滑条可改，下面是默认值
+//   mask = (R - B) > 差分阈值
+const int kDefaultDiffThreshold = 70; // R - B 差分阈值默认值
+
 const double kCannyLow = 50.0;
 const double kCannyHigh = 150.0;
 const int kCannyAperture = 3;
@@ -67,8 +70,13 @@ const float kMaxParallelCross = 0.20f; // 两条长边不平行度上限（≈12
 const double kMaxCornerDistPx = 30.0;     // 交点离轮廓超过此值视为跑飞
 const double kMinPointSeparationPx = 3.0; // 去重距离
 const double kMinShortEdgeDevDeg = 40.0;  // 短边与长边方向至少要差这么多度
+const double kMaxShortEdgeOffPx = 10.0;   // 拟合出的短边直线到短边中点的最大偏离
+const int kMinShortFitPoints = 2;         // 拟合短边直线至少要几个等分点
 
 const double kMinBarSpacingPx = 20.0; // 两光条质心最小水平间距
+
+// 滑条可改的差分阈值（相机线程每帧 load 一次，开销可忽略）
+std::atomic<int> gDiffThreshold{kDefaultDiffThreshold};
 
 // 8 个角点的名字，顺序与 points3D 一致
 const char *const kCornerName[8] = {"L-TL", "L-BL", "L-BR", "L-TR",
@@ -94,6 +102,202 @@ Line2D makeLine(const cv::Vec4f &fit)
     Line2D L{-vy, vx, 0.0}; // 法向量 = (vx, vy) 逆时针转 90°
     L.c = -(L.a * x0 + L.b * y0);
     return L;
+}
+
+// Line2D -> 方向角 [0,180)，与 ea/votes 的角度口径一致
+double lineAngleDeg(const Line2D &L)
+{
+    double ang = std::atan2(L.a, -L.b) * 180.0 / CV_PI;
+    if (ang < 0)
+        ang += 180.0;
+    return ang;
+}
+
+// ============================================================================
+//  调试绘制：半透明文字面板（左上角显示实时数值）
+// ============================================================================
+//  先铺一块半透明黑底再写字，亮背景/暗背景都能看清
+void drawTextPanel(cv::Mat &img, const std::vector<std::string> &lines,
+                   const cv::Point &origin, double fontScale, int lineHeight,
+                   const cv::Scalar &color)
+{
+    if (lines.empty())
+        return;
+
+    int maxW = 0;
+    for (const auto &t : lines)
+    {
+        int base = 0;
+        const cv::Size sz = cv::getTextSize(t, cv::FONT_HERSHEY_SIMPLEX, fontScale, 1, &base);
+        maxW = std::max(maxW, sz.width);
+    }
+    const int pad = 6;
+    const int h = lineHeight * static_cast<int>(lines.size()) + 2 * pad;
+    const int w = maxW + 2 * pad;
+    const cv::Rect box(origin.x, origin.y - lineHeight + pad, w, h);
+
+    // 裁剪到图像内再填，避免越界
+    const cv::Rect imgRect(0, 0, img.cols, img.rows);
+    const cv::Rect safe = box & imgRect;
+    if (safe.area() > 0)
+    {
+        cv::Mat roi = img(safe);
+        cv::addWeighted(roi, 0.30, cv::Mat(roi.size(), roi.type(), cv::Scalar(0, 0, 0)), 0.70, 0, roi);
+    }
+
+    for (size_t i = 0; i < lines.size(); ++i)
+        cv::putText(img, lines[i], origin + cv::Point(pad, lineHeight * static_cast<int>(i)),
+                    cv::FONT_HERSHEY_SIMPLEX, fontScale, color, 1, cv::LINE_AA);
+}
+
+// ============================================================================
+//  调试绘制：坐标系三轴
+// ============================================================================
+//  颜色固定为 X=红、Y=绿、Z=蓝（BGR 下分别是 (0,0,255)/(0,255,0)/(255,0,0)）
+const cv::Scalar kAxisBGR[3] = {cv::Scalar(0, 0, 255), cv::Scalar(0, 220, 0),
+                                cv::Scalar(255, 0, 0)};
+const char *const kAxisName[3] = {"x", "y", "z"};
+
+// 带黑描边的文字：直接压在箭头/角点上也能看清，不用铺半透明底板
+void putTextOutline(cv::Mat &img, const std::string &text, const cv::Point &org,
+                    double fontScale, const cv::Scalar &color)
+{
+    cv::putText(img, text, org, cv::FONT_HERSHEY_SIMPLEX, fontScale,
+                cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+    cv::putText(img, text, org, cv::FONT_HERSHEY_SIMPLEX, fontScale, color, 1,
+                cv::LINE_AA);
+}
+
+// 轴向的深度标签：相机 +z 指向"屏幕里"（远离观察者）
+//   d.z > 0 -> 指向纸面内(away)   d.z < 0 -> 指向纸面外(朝向观察者)
+const char *axisDepthTag(const cv::Vec3d &d)
+{
+    if (d[2] > 0.2)
+        return " in";   // into screen
+    if (d[2] < -0.2)
+        return " out";  // toward viewer
+    return "";          // 基本在图像平面内
+}
+
+// 画"方位指示器"：原点不在视野里时用。
+//  R_cam_from_frame 的三列 = 该系三轴在相机系下的方向；
+//  在这里做正交投影（相当于站在相机位置看过去）：图像 u 轴 = 相机 +x，
+//  图像 v 轴 = 相机 +y（向下）。因此：
+//    轴基本垂直纸面（|x|,|y| 都很小）→ 画成圆点并标注"⊙/⊗"
+//    否则 → 按方向画一根定长箭头
+void drawOrientationGizmo(cv::Mat &img, const cv::Matx33d &R_cam_from_frame,
+                          const cv::Point &anchor, int size, const char *label)
+{
+    cv::circle(img, anchor, 3, cv::Scalar(255, 255, 255), -1, cv::LINE_AA);
+    cv::putText(img, label, anchor + cv::Point(-size, -size - 6),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+
+    for (int c = 0; c < 3; ++c)
+    {
+        const cv::Vec3d d(R_cam_from_frame(0, c), R_cam_from_frame(1, c),
+                          R_cam_from_frame(2, c));
+        const double n = std::hypot(d[0], d[1]); // 在图像平面上的投影长度
+        if (n < 0.25)
+        {
+            // 几乎沿光轴：正对/背对观察者，画圆点
+            const bool toward = d[2] < 0.0; // 相机 +z 指向"屏幕里"，所以 d[2]<0 是朝向观察者
+            cv::circle(img, anchor, 7, kAxisBGR[c], 1, cv::LINE_AA);
+            if (toward)
+                cv::circle(img, anchor, 2, kAxisBGR[c], -1, cv::LINE_AA);
+            const std::string t = std::string(kAxisName[c]) + axisDepthTag(d);
+            cv::putText(img, t, anchor + cv::Point(10, -10),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.45, kAxisBGR[c], 1, cv::LINE_AA);
+            continue;
+        }
+        const cv::Point tip(anchor.x + cvRound(d[0] / n * size),
+                            anchor.y + cvRound(d[1] / n * size));
+        cv::arrowedLine(img, anchor, tip, kAxisBGR[c], 2, cv::LINE_AA, 0, 0.28);
+        const std::string t = std::string(kAxisName[c]) + axisDepthTag(d);
+        cv::putText(img, t, tip + cv::Point(5, -5),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, kAxisBGR[c], 1, cv::LINE_AA);
+    }
+}
+
+// 虚线箭头：杆画成虚线段，末端留一段实心箭头。
+// 用来画"次要"的那个坐标系，和实线箭头一眼可分。
+void drawDashedArrow(cv::Mat &img, const cv::Point2f &from, const cv::Point2f &to,
+                     const cv::Scalar &color, int thickness)
+{
+    const cv::Point2f d = to - from;
+    const float len = cv::norm(d);
+    if (len < 3.f)
+        return;
+    const cv::Point2f u = d / len;
+    const float shaft = len * 0.72f;   // 杆占 72%，剩下给箭头
+    for (float t = 0.f; t < shaft; t += 9.f)
+        cv::line(img, from + u * t, from + u * std::min(t + 5.f, shaft), color,
+                 thickness, cv::LINE_AA);
+    cv::arrowedLine(img, from + u * (len * 0.5f), to, color, thickness, cv::LINE_AA, 0, 0.3);
+}
+
+// 画"真实三维三轴"：原点在相机系下已知，三列方向也已知，走透视投影。
+//  端点跑到相机后方（z<=1）的轴直接跳过。
+void drawAxesAtPoint(cv::Mat &img, const cv::Matx33d &K, const std::vector<double> &D,
+                     const cv::Point3d &originCam, const cv::Matx33d &R_cam_from_frame,
+                     double len, int thickness, double fontScale, bool withLabels = true,
+                     bool dashed = false, bool outlined = false)
+{
+    std::vector<cv::Point3f> pts;
+    pts.emplace_back((float)originCam.x, (float)originCam.y, (float)originCam.z);
+    for (int c = 0; c < 3; ++c)
+        pts.emplace_back((float)(originCam.x + R_cam_from_frame(0, c) * len),
+                         (float)(originCam.y + R_cam_from_frame(1, c) * len),
+                         (float)(originCam.z + R_cam_from_frame(2, c) * len));
+
+    std::vector<cv::Point2f> uv;
+    cv::projectPoints(pts, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 0), cv::Mat(K), D, uv);
+
+    cv::circle(img, uv[0], 3, cv::Scalar(255, 255, 255), -1, cv::LINE_AA);
+    for (int c = 0; c < 3; ++c)
+    {
+        if (pts[c + 1].z <= 1.0f)
+            continue; // 端点跑到相机后方
+
+        // 几乎沿光轴的轴（比如正对相机时的板法向）透视投影只剩几个像素，
+        // 箭头看不出朝向，改用和 base_link 指示器一致的 ⊙/⊗ 标记。
+        const cv::Vec3d dir(R_cam_from_frame(0, c), R_cam_from_frame(1, c),
+                            R_cam_from_frame(2, c));
+        if (std::hypot(dir[0], dir[1]) < 0.25)
+        {
+            // 半径要比原点那个白色实心点(3)大，否则标记会被它吞掉
+            cv::circle(img, uv[0], 9, kAxisBGR[c], 1, cv::LINE_AA);
+            if (dir[2] < 0.0) // 相机 +z 指向屏幕里，所以 z<0 是朝向观察者
+                cv::circle(img, uv[0], 4, kAxisBGR[c], -1, cv::LINE_AA);
+            else
+            {
+                cv::line(img, uv[0] + cv::Point2f(-5.f, -5.f), uv[0] + cv::Point2f(5.f, 5.f),
+                         kAxisBGR[c], 1, cv::LINE_AA);
+                cv::line(img, uv[0] + cv::Point2f(-5.f, 5.f), uv[0] + cv::Point2f(5.f, -5.f),
+                         kAxisBGR[c], 1, cv::LINE_AA);
+            }
+            // 这个标记必须带 in/out 文字，否则 ⊙/⊗ 本身看不出朝向
+            putTextOutline(img, std::string(kAxisName[c]) + axisDepthTag(dir),
+                           uv[0] + cv::Point2f(12.f, -12.f), fontScale, kAxisBGR[c]);
+            continue;
+        }
+        if (outlined)   // 先画一遍略粗的黑箭头当描边，再压上彩色：彩色仍是主体
+            cv::arrowedLine(img, uv[0], uv[c + 1], cv::Scalar(0, 0, 0),
+                            thickness + 1, cv::LINE_AA, 0, 0.25);
+        if (dashed)
+            drawDashedArrow(img, uv[0], uv[c + 1], kAxisBGR[c], thickness);
+        else
+            cv::arrowedLine(img, uv[0], uv[c + 1], kAxisBGR[c], thickness, cv::LINE_AA, 0, 0.25);
+        const bool inside = uv[c + 1].x >= 0 && uv[c + 1].y >= 0 &&
+                            uv[c + 1].x < img.cols && uv[c + 1].y < img.rows;
+        if (inside && withLabels)
+        {
+            const cv::Vec3d d(R_cam_from_frame(0, c), R_cam_from_frame(1, c),
+                              R_cam_from_frame(2, c));
+            const std::string t = std::string(kAxisName[c]) + axisDepthTag(d);
+            putTextOutline(img, t, uv[c + 1] + cv::Point2f(5.f, -5.f), fontScale,
+                           kAxisBGR[c]);
+        }
+    }
 }
 
 // 两条直线求交，平行时返回 false
@@ -144,20 +348,28 @@ void orderCornersCCW(std::vector<cv::Point2f> &pts)
 }
 
 // ============================================================================
-//  预处理：二值化 -> 闭运算 -> 高斯（同时留作梯度图）-> Canny
+//  预处理：直接做红蓝通道差分，阈值二值化，不做开闭运算
+//  适合“红灯条 / 蓝灯条颜色特征明显”的装甲板。
+//  这里默认按红灯条处理：diff = R - B，阈值取 gDiffThreshold（滑条可改）。
+//  若目标实际为蓝色灯条，只需把 diff 方向改为 B - R 即可。
 // ============================================================================
 void preprocess(const cv::Mat &bgrFrame, cv::Mat &mask, cv::Mat &maskBlur, cv::Mat &edges)
 {
-    cv::Mat hsv;
-    cv::cvtColor(bgrFrame, hsv, cv::COLOR_BGR2HSV);
-    cv::inRange(hsv, kHsvLow, kHsvHigh, mask);
+    std::array<cv::Mat, 3> ch{};
+    cv::split(bgrFrame, ch);
 
-    const cv::Mat kernel = cv::getStructuringElement(
-        cv::MORPH_ELLIPSE, cv::Size(kMorphKernel, kMorphKernel));
-    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+    const int diffTh = gDiffThreshold.load(std::memory_order_relaxed);
 
-    cv::GaussianBlur(mask, maskBlur, cv::Size(kBlurKernel, kBlurKernel), 0);
-    cv::Canny(maskBlur, edges, kCannyLow, kCannyHigh, kCannyAperture, true);
+    // 红灯条：差分增强（8U 下 cv::subtract 饱和，R < B 直接截成 0）
+    cv::Mat diff;
+    cv::subtract(ch[2], ch[0], diff); // R - B
+
+    // 直接二值化：保留强红偏差目标
+    cv::threshold(diff, mask, diffTh, 255, cv::THRESH_BINARY);
+
+    // 不做开闭运算；直接保留整块二值图用于后续轮廓和梯度计算。
+    maskBlur = mask.clone();
+    cv::Canny(mask, edges, kCannyLow, kCannyHigh, kCannyAperture, true);
 }
 
 // ============================================================================
@@ -295,40 +507,68 @@ bool extractBarCorners(const std::vector<cv::Point> &contour,
         LB.c = -LB.c;
     }
 
-    Line2D Lmid{LA.a + LB.a, LA.b + LB.b, LA.c + LB.c};
-    const double nn = std::hypot(Lmid.a, Lmid.b);
-    if (nn < 1e-9)
-        return false;
-    Lmid.a /= nn;
-    Lmid.b /= nn;
-    Lmid.c /= nn;
-
-    // ---- 4) 中线与轮廓求交（这两个点只是短边中点，用来找短边方向）----
-    std::vector<cv::Point2f> ends;
-    for (int i = 0; i < n; ++i)
+    // ---- 3b) 与两条长边平行、位于 1/4 / 2/4 / 3/4 处的三条线 ----
+    //  f 是"从 LA 到 LB 的相对位置"：f=0 就是 LA，f=1 就是 LB，f=0.5 就是中线
+    auto lerpLine = [&](double f)
     {
-        const cv::Point2f p0 = contour[i];
-        const cv::Point2f p1 = contour[(i + 1) % n];
-        const double s0 = Lmid.a * p0.x + Lmid.b * p0.y + Lmid.c;
-        const double s1 = Lmid.a * p1.x + Lmid.b * p1.y + Lmid.c;
-        if (s0 * s1 > 0)
-            continue;
-        if (std::abs(s0 - s1) < 1e-9)
-            continue;
-        const double t = s0 / (s0 - s1);
-        if (t < 0.0 || t > 1.0)
-            continue;
-        const cv::Point2f h = p0 + static_cast<float>(t) * (p1 - p0);
-        bool dup = false; // 相邻两段会给出同一个交点
-        for (const auto &e : ends)
-            if (cv::norm(h - e) < kMinPointSeparationPx)
-            {
-                dup = true;
-                break;
-            }
-        if (!dup)
-            ends.push_back(h);
+        Line2D L{(1.0 - f) * LA.a + f * LB.a,
+                 (1.0 - f) * LA.b + f * LB.b,
+                 (1.0 - f) * LA.c + f * LB.c};
+        const double nn = std::hypot(L.a, L.b);
+        if (nn < 1e-9)
+            return Line2D{0.0, 0.0, 0.0}; // 退化成点，a==b==0，调用方据此判失败
+        L.a /= nn;
+        L.b /= nn;
+        L.c /= nn;
+        return L;
+    };
+
+    // 直线与轮廓的所有交点（亚像素，去重）
+    auto intersectContour = [&](const Line2D &L, std::vector<cv::Point2f> &hits)
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            const cv::Point2f p0 = contour[i];
+            const cv::Point2f p1 = contour[(i + 1) % n];
+            const double s0 = L.a * p0.x + L.b * p0.y + L.c;
+            const double s1 = L.a * p1.x + L.b * p1.y + L.c;
+            if (s0 * s1 > 0)
+                continue;
+            if (std::abs(s0 - s1) < 1e-9)
+                continue;
+            const double t = s0 / (s0 - s1);
+            if (t < 0.0 || t > 1.0)
+                continue;
+            const cv::Point2f h = p0 + static_cast<float>(t) * (p1 - p0);
+            bool dup = false; // 相邻两段会给出同一个交点
+            for (const auto &d : hits)
+                if (cv::norm(h - d) < kMinPointSeparationPx)
+                {
+                    dup = true;
+                    break;
+                }
+            if (!dup)
+                hits.push_back(h);
+        }
+    };
+
+    // ---- 4) 三条平行线 × 轮廓 = 每条短边上的三个等分点 ----
+    //  只用中线交点 + 该点附近的梯度方向定短边，等于"一个点定一条直线"，
+    //  点的噪声会整块变成方向误差；改成 1/4、2/4、3/4 三条线的交点共 3 个点拟合，
+    //  思路仍是"先拟合长边、再由长边推出短边"，只是把短边的约束从 1 点变成 3 点。
+    const std::array<double, 3> kFrac{0.25, 0.5, 0.75};
+    std::array<std::vector<cv::Point2f>, 3> fracHits;
+    std::array<Line2D, 3> fracLines;
+    for (int i = 0; i < 3; ++i)
+    {
+        fracLines[i] = lerpLine(kFrac[i]);
+        if (fracLines[i].a == 0.0 && fracLines[i].b == 0.0)
+            return false;
+        intersectContour(fracLines[i], fracHits[i]);
     }
+
+    // 中线（2/4）与轮廓的两个交点 = 上下两条短边的中点
+    const std::vector<cv::Point2f> &ends = fracHits[1];
     if (ends.size() < 2)
         return false;
 
@@ -346,7 +586,9 @@ bool extractBarCorners(const std::vector<cv::Point> &contour,
             }
         }
 
-    // ---- 5) 沿轮廓两侧各走一小段，估出短边方向 ----
+    // ---- 5) 短边直线：优先用三个等分点拟合，退化时回退到邻域梯度方向 ----
+    //  5a 用 1/4、2/4、3/4 三个交点拟合（默认路径）
+    //  5b 回到原来的做法：中线交点 + 该点前后几个轮廓点的梯度方向
     auto sideAngle = [&](int near, int dir, double &ang) -> bool
     {
         double sx = 0, sy = 0;
@@ -377,37 +619,80 @@ bool extractBarCorners(const std::vector<cv::Point> &contour,
     std::vector<Line2D> shortLines;
     for (int e : {i0, i1})
     {
-        int near = 0;
-        double bd = 1e18;
-        for (int i = 0; i < n; ++i)
+        // 三条平行线在这一端各给一个交点，正好是短边上的 1/4、2/4、3/4 点
+        std::vector<cv::Point2f> onEdge;
+        for (int li = 0; li < 3; ++li)
         {
-            const double d = cv::norm(cv::Point2f(contour[i]) - ends[e]);
-            if (d < bd)
+            int best = -1;
+            double bdHit = 1e18;
+            for (int k = 0; k < static_cast<int>(fracHits[li].size()); ++k)
             {
-                bd = d;
-                near = i;
+                const double d = cv::norm(fracHits[li][k] - ends[e]);
+                if (d < bdHit)
+                {
+                    bdHit = d;
+                    best = k;
+                }
+            }
+            if (best >= 0)
+                onEdge.push_back(fracHits[li][best]);
+        }
+
+        // ---- 5a) 首选用这 3 个等分点直接拟合短边直线 ----
+        Line2D Ls{};
+        bool haveLine = false;
+        if (static_cast<int>(onEdge.size()) >= kMinShortFitPoints)
+        {
+            cv::Vec4f fs;
+            cv::fitLine(onEdge, fs, cv::DIST_L2, 0, 0.01, 0.01);
+            const Line2D cand = makeLine(fs);
+            // 拟合出的方向不能和长边平行；且必须穿过该短边中点（否则是挑错了点）
+            const double off = std::abs(cand.a * ends[e].x + cand.b * ends[e].y + cand.c);
+            if (devFromLong(lineAngleDeg(cand)) >= kMinShortEdgeDevDeg &&
+                off <= kMaxShortEdgeOffPx)
+            {
+                Ls = cand;
+                haveLine = true;
             }
         }
 
-        double aF = 0, aB = 0;
-        const bool hF = sideAngle(near, +1, aF);
-        const bool hB = sideAngle(near, -1, aB);
-        double ang = -1;
-        if (hF && hB)
-            ang = (devFromLong(aF) > devFromLong(aB)) ? aF : aB;
-        else if (hF)
-            ang = aF;
-        else if (hB)
-            ang = aB;
-        if (ang < 0 || devFromLong(ang) < kMinShortEdgeDevDeg)
-            continue;
+        // ---- 5b) 兜底：等分点不够时仍按原来的"单点 + 邻域梯度方向"定线 ----
+        if (!haveLine)
+        {
+            int near = 0;
+            double bd = 1e18;
+            for (int i = 0; i < n; ++i)
+            {
+                const double d = cv::norm(cv::Point2f(contour[i]) - ends[e]);
+                if (d < bd)
+                {
+                    bd = d;
+                    near = i;
+                }
+            }
 
-        const double r = ang * CV_PI / 180.0;
-        const cv::Point2f dir(static_cast<float>(std::cos(r)),
-                              static_cast<float>(std::sin(r)));
-        // 法向量 = 方向逆时针转 90° = (-dir.y, dir.x)
-        shortLines.push_back(Line2D{-dir.y, dir.x,
-                                    -(double(-dir.y) * ends[e].x + double(dir.x) * ends[e].y)});
+            double aF = 0, aB = 0;
+            const bool hF = sideAngle(near, +1, aF);
+            const bool hB = sideAngle(near, -1, aB);
+            double ang = -1;
+            if (hF && hB)
+                ang = (devFromLong(aF) > devFromLong(aB)) ? aF : aB;
+            else if (hF)
+                ang = aF;
+            else if (hB)
+                ang = aB;
+            if (ang < 0 || devFromLong(ang) < kMinShortEdgeDevDeg)
+                continue;
+
+            const double r = ang * CV_PI / 180.0;
+            const cv::Point2f dir(static_cast<float>(std::cos(r)),
+                                  static_cast<float>(std::sin(r)));
+            // 法向量 = 方向逆时针转 90° = (-dir.y, dir.x)
+            Ls = Line2D{-dir.y, dir.x,
+                        -(double(-dir.y) * ends[e].x + double(dir.x) * ends[e].y)};
+        }
+
+        shortLines.push_back(Ls);
     }
 
     // ---- 6) 两条短边 × 两条长边 = 4 个亚像素角点 ----
@@ -454,10 +739,37 @@ bool extractBarCorners(const std::vector<cv::Point> &contour,
 //  整帧检测：图像 -> 8 个角点
 // ============================================================================
 bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
-                std::string *reason)
+                std::string *reason, DetectDebug *dbg = nullptr)
 {
     points2D.clear();
     DetectTrace trace;
+
+    // 退出时统一把中间量同步给调用方（生产路径 dbg == nullptr，零开销）
+    struct DebugSync
+    {
+        DetectDebug *dbg = nullptr;
+        const std::vector<cv::Point2f> &pts;
+        std::string *reason = nullptr;
+        bool ok = false;
+        ~DebugSync()
+        {
+            if (!dbg)
+                return;
+            dbg->ok = ok;
+            dbg->points2D = pts;
+            if (!ok && reason)
+                dbg->reason = *reason;
+        }
+    } sync{dbg, points2D, reason};
+    if (dbg)
+    {
+        dbg->ok = false;
+        dbg->reason.clear();
+        dbg->bars.clear();
+        dbg->contours.clear();
+        dbg->mask.release();
+    }
+
     if (bgrFrame.empty())
     {
         if (reason)
@@ -468,12 +780,16 @@ bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
 
     cv::Mat mask, maskBlur, edges;
     preprocess(bgrFrame, mask, maskBlur, edges);
+    if (dbg)
+        dbg->mask = mask;
 
     // 必须用 CHAIN_APPROX_NONE：SIMPLE 会把直边上的点抽稀成两个端点，
     // 那样直边方向直方图里几乎没有点可统计
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
     trace.contours = contours.size();
+    if (dbg)
+        dbg->contours = contours;
 
     // ---- 梯度只在轮廓包围盒内计算 ----
     // 整帧算 Sobel×2 + magnitude + phase 约占整条检测链 50% 的时间，
@@ -525,6 +841,19 @@ bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
     }
     trace.bars = bars.size();
 
+    // 按质心 x 从左到右排序。不能依赖 findContours 的顺序（它没有顺序保证），
+    // 这样 [0..3] 一定是左条、[4..7] 一定是右条
+    std::sort(bars.begin(), bars.end(),
+              [](const Bar &a, const Bar &b) { return a.cx < b.cx; });
+
+    // 调参视图用：光条没凑齐 2 根也把已拟合的梯形带出去
+    if (dbg)
+    {
+        dbg->bars.reserve(bars.size());
+        for (const auto &b : bars)
+            dbg->bars.push_back(b.pts);
+    }
+
     if (bars.size() != 2)
     {
         if (reason)
@@ -532,11 +861,6 @@ bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
         trace.result = "光条数不足";
         return false;
     }
-
-    // 按质心 x 从左到右排序。不能依赖 findContours 的顺序（它没有顺序保证），
-    // 这样 [0..3] 一定是左条、[4..7] 一定是右条
-    std::sort(bars.begin(), bars.end(),
-              [](const Bar &a, const Bar &b) { return a.cx < b.cx; });
 
     if (bars[1].cx - bars[0].cx < kMinBarSpacingPx)
     {
@@ -557,6 +881,7 @@ bool detectImpl(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D,
         for (const auto &p : b.pts)
             points2D.push_back(p);
 
+    sync.ok = true;
     return true;
 }
 
@@ -568,7 +893,7 @@ struct PoseDetail
 {
     std::vector<cv::Point2f> points2D;
     std::vector<cv::Point2f> reproj;
-    cv::Matx33d R_armor_to_cam = cv::Matx33d::eye();
+    cv::Matx33d R_cam_from_armor = cv::Matx33d::eye();
     cv::Vec3d t_armor_in_cam = cv::Vec3d(0, 0, 0);
     double errMeanPx = 0.0;
 };
@@ -602,20 +927,96 @@ CarTarget poseImpl(const std::vector<cv::Point2f> &points2D, const PnPDate &data
         return out;
     }
 
-    int best = 0;
-    double bestErr = 1e18;
-    std::vector<std::vector<cv::Point2f>> projs(static_cast<size_t>(nSol));
+    // ---- 选解：误差优先 + 物理约束 + 时序连续性 ----
+    // IPPE 对共面点必然给 2 个解，两解姿态差 27~30°，而重投影误差只差 0.3~0.5 px。
+    // 只按误差最小挑，余量太薄，噪声一变就翻解（姿态瞬间跳几十度）。
+    struct Cand
+    {
+        int idx = -1;
+        double err = 0.0;   // 累加器，必须从 0 开始（从 1e18 起会让两解误差差不出区别）
+        cv::Matx33d R = cv::Matx33d::eye();
+        bool normalOk = true;   // 板法向是否朝相机（物理可行）
+    };
+    std::vector<Cand> cands;
+    cands.reserve(static_cast<size_t>(nSol));
     for (int i = 0; i < nSol; ++i)
     {
-        cv::projectPoints(data.points3D, rvecs[i], tvecs[i], K, D, projs[i]);
-        double e = 0.0;
-        for (size_t k = 0; k < projs[i].size(); ++k)
-            e += cv::norm(projs[i][k] - points2D[k]);
-        e /= static_cast<double>(projs[i].size());
-        if (e < bestErr)
+        Cand c;
+        c.idx = i;
+        std::vector<cv::Point2f> proj;
+        cv::projectPoints(data.points3D, rvecs[i], tvecs[i], K, D, proj);
+        for (size_t k = 0; k < proj.size(); ++k)
+            c.err += cv::norm(proj[k] - points2D[k]);
+        c.err /= static_cast<double>(proj.size());
+
+        cv::Mat Ri;
+        cv::Rodrigues(rvecs[i], Ri);
+        c.R = cv::Matx33d(Ri);
+        // 装甲板 +Z = 板法向；正面朝相机时，其在相机系下的 z 分量必须为负
+        c.normalOk = c.R(2, 2) < 0.0;
+        cands.push_back(c);
+    }
+
+    // 上一帧的姿态（用于打平时判定连续性）。跨调用共享，加锁保护；
+    // 超过 priorMaxAgeSec 未更新则视为失效，避免旧姿态把结果锁死。
+    static std::mutex priorMtx;
+    static cv::Matx33d priorR = cv::Matx33d::eye();
+    static bool havePrior = false;
+    static std::chrono::steady_clock::time_point priorTp;
+    cv::Matx33d prevR;
+    bool usePrev = false;
+    if (opt.useTemporalPrior)
+    {
+        std::lock_guard<std::mutex> lk(priorMtx);
+        const auto age = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - priorTp).count();
+        usePrev = havePrior && age <= opt.priorMaxAgeSec;
+        prevR = priorR;
+    }
+
+    auto angleDeg = [](const cv::Matx33d &A, const cv::Matx33d &B)
+    {
+        const cv::Matx33d d = A.t() * B;
+        const double tr = d(0, 0) + d(1, 1) + d(2, 2);
+        return std::acos(std::max(-1.0, std::min(1.0, (tr - 1.0) * 0.5))) * 180.0 / CV_PI;
+    };
+
+    // ① 物理约束：只保留法向朝相机的解（若全都被剔除则不约束，交给误差）
+    std::vector<Cand> pool;
+    for (const auto &c : cands)
+        if (!opt.requireNormalTowardCamera || c.normalOk)
+            pool.push_back(c);
+    if (pool.empty())
+        pool = cands;
+
+    // ② 误差排序
+    std::sort(pool.begin(), pool.end(),
+              [](const Cand &a, const Cand &b) { return a.err < b.err; });
+
+    int best = pool.front().idx;
+    double gap = -1.0;
+    bool ambiguous = false;
+
+    if (pool.size() >= 2)
+    {
+        gap = pool[1].err - pool[0].err;
+        ambiguous = gap <= opt.solErrMarginPx;
+
+        // ③ 误差打平时，用上一帧姿态决出（迟滞，防在两簇之间来回跳）
+        if (ambiguous && usePrev)
         {
-            bestErr = e;
-            best = i;
+            int pick = pool.front().idx;
+            double bestAng = angleDeg(prevR, pool.front().R);
+            for (size_t i = 1; i < pool.size(); ++i)
+            {
+                const double a = angleDeg(prevR, pool[i].R);
+                if (a < bestAng)
+                {
+                    bestAng = a;
+                    pick = pool[i].idx;
+                }
+            }
+            best = pick;
         }
     }
 
@@ -628,7 +1029,7 @@ CarTarget poseImpl(const std::vector<cv::Point2f> &points2D, const PnPDate &data
     cv::Rodrigues(rvec, R);
     cv::projectPoints(data.points3D, rvec, tvec, K, D, det.reproj);
 
-    det.R_armor_to_cam = cv::Matx33d(R);
+    det.R_cam_from_armor = cv::Matx33d(R);
     det.t_armor_in_cam = cv::Vec3d(tvec.at<double>(0), tvec.at<double>(1),
                                    tvec.at<double>(2));
 
@@ -640,24 +1041,37 @@ CarTarget poseImpl(const std::vector<cv::Point2f> &points2D, const PnPDate &data
     // ---- 装甲板系 -> 车体系 ----
     //   P_car = R_car_from_cam * (R * P_armor + t) + t_cam_in_car
     // 展开后：
-    //   R_armor_to_car = R_car_from_cam * R
+    //   R_car_from_armor = R_car_from_cam * R
     //   t_armor_in_car = R_car_from_cam * t + t_cam_in_car
-    const cv::Matx33d R_armor_to_car = opt.R_car_from_cam * det.R_armor_to_cam;
+    const cv::Matx33d R_car_from_armor = opt.R_car_from_cam * det.R_cam_from_armor;
     const cv::Vec3d t_armor_in_car =
         cv::Vec3d(opt.R_car_from_cam * det.t_armor_in_cam) + opt.t_cam_in_car;
 
     // ★ 目标点：点要平移
     const cv::Vec3d pointArmor(data.m_point.x, data.m_point.y, data.m_point.z);
-    out.point = cv::Vec3d(R_armor_to_car * pointArmor) + t_armor_in_car;
+    out.point = cv::Vec3d(R_car_from_armor * pointArmor) + t_armor_in_car;
 
     // ★ 目标向量：自由向量，只旋转不平移
     const cv::Vec3d vecArmor(data.v[0], data.v[1], data.v[2]);
-    out.vec = cv::Vec3d(R_armor_to_car * vecArmor);
+    out.vec = cv::Vec3d(R_car_from_armor * vecArmor);
 
-    out.R_armor_to_car = R_armor_to_car;
+    out.R_car_from_armor = R_car_from_armor;
+    out.solGapPx = gap;
+    out.solAmbiguous = ambiguous;
+    // ★ 目标系：X 目标 = -X 装甲板，Y 目标 = -Z 装甲板，Z 目标 = -Y 装甲板
+    out.R_car_from_target = R_car_from_armor * opt.R_armor_from_target;
 
     out.errMeanPx = det.errMeanPx;
     out.ok = true;
+
+    // 更新"上一帧姿态"，供下一次选解使用
+    if (opt.useTemporalPrior)
+    {
+        std::lock_guard<std::mutex> lk(priorMtx);
+        priorR = det.R_cam_from_armor;
+        havePrior = true;
+        priorTp = std::chrono::steady_clock::now();
+    }
     return out;
 }
 
@@ -697,11 +1111,218 @@ bool detectCorners(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D)
     return detectImpl(bgrFrame, points2D, nullptr);
 }
 
+bool detectCornersDebug(const cv::Mat &bgrFrame, DetectDebug &dbg)
+{
+    std::string reason;
+    const bool ok = detectImpl(bgrFrame, dbg.points2D, &reason, &dbg);
+    if (!ok)
+        dbg.reason = reason;
+    return ok;
+}
+
+int binaryDiffThreshold()
+{
+    return gDiffThreshold.load(std::memory_order_relaxed);
+}
+
+void setBinaryDiffThreshold(int diffThreshold)
+{
+    gDiffThreshold.store(std::clamp(diffThreshold, 0, 255), std::memory_order_relaxed);
+}
+
 CarTarget solveCarTargetFromCorners(const std::vector<cv::Point2f> &points2D,
                                     const PnPDate &data,
                                     const CarTargetOptions &opt)
 {
     return poseImpl(points2D, data, opt);
+}
+
+void drawFrameOverlay(cv::Mat &bgrFrame, const PnPDate &data, const CarTarget &target,
+                      const CarTargetOptions &opt, double targetAxisLenMm, int gizmoSize,
+                      const ExtraFrame &extra)
+{
+    if (bgrFrame.empty())
+        return;
+
+    const cv::Matx33d K = data.cameraMatrix;
+    const std::vector<double> &D = data.distCoeffs;
+
+    // 车体系 -> 相机系
+    const cv::Matx33d R_cam_from_car = opt.R_car_from_cam.t();
+    const cv::Vec3d t_car_in_cam = -(R_cam_from_car * opt.t_cam_in_car);
+
+    // ---- ① base_link 方位指示器：放右下角 ----
+    // base_link 原点在相机上方几百 mm、前方只有几百 mm，投影落在画面外，
+    // 所以这里不画它"在哪里"，只画"三根轴朝哪"（正交投影 = 从相机看过去的样子）。
+    const cv::Point anchor(bgrFrame.cols - gizmoSize - 70, bgrFrame.rows - gizmoSize - 45);
+    drawOrientationGizmo(bgrFrame, R_cam_from_car, anchor, gizmoSize, "base_link");
+
+    // ---- ② 目标点处的目标系三轴（真实透视投影，能直接看出方位对不对）----
+    if (!target.ok)
+        return;
+
+    const cv::Vec3d p_car(target.point[0], target.point[1], target.point[2]);
+    const cv::Vec3d p_cam = R_cam_from_car * p_car + t_car_in_cam;
+    const cv::Matx33d R_cam_from_target = R_cam_from_car * target.R_car_from_target;
+
+    // 装甲板原点（目标点减去装甲板系下的偏置，反算回来）
+    const cv::Vec3d mPoint(data.m_point.x, data.m_point.y, data.m_point.z);
+    const cv::Vec3d armorOrigin_car =
+        cv::Vec3d(target.point[0], target.point[1], target.point[2]) -
+        cv::Vec3d(target.R_car_from_armor * mPoint);
+    const cv::Vec3d armorOrigin_cam = R_cam_from_car * armorOrigin_car + t_car_in_cam;
+
+    std::vector<cv::Point3f> two{
+        cv::Point3f((float)armorOrigin_cam[0], (float)armorOrigin_cam[1], (float)armorOrigin_cam[2]),
+        cv::Point3f((float)p_cam[0], (float)p_cam[1], (float)p_cam[2])};
+    std::vector<cv::Point2f> uvo;
+    cv::projectPoints(two, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 0), cv::Mat(K), D, uvo);
+
+    // 装甲板原点十字 + 到目标点的连线（虚线），方便看偏置是往哪个方向甩出去的
+    const int cross = 8;
+    cv::line(bgrFrame, uvo[0] - cv::Point2f(cross, 0), uvo[0] + cv::Point2f(cross, 0),
+             cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+    cv::line(bgrFrame, uvo[0] - cv::Point2f(0, cross), uvo[0] + cv::Point2f(0, cross),
+             cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+    // 装甲板系的名字不写在原点上（会和近轴向轴的 in/out 标签撞），
+    // 靠左下角图例的 "solid = target frame / dashed = armor frame" 区分
+    for (int k = 0; k < 12; k += 2)   // 虚线
+    {
+        const cv::Point2f a = uvo[0] + (uvo[1] - uvo[0]) * (k / 12.f);
+        const cv::Point2f b = uvo[0] + (uvo[1] - uvo[0]) * ((k + 1) / 12.f);
+        cv::line(bgrFrame, a, b, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+    }
+    // 装甲板系三轴：虚线 + 比目标系更长（两系原点才差 160mm，等长会完全重叠），
+    // 也不标逐轴字母，只用一个带描边的名字说明"这一组虚线是装甲板系"
+    const cv::Matx33d R_cam_from_armor = R_cam_from_car * target.R_car_from_armor;
+    drawAxesAtPoint(bgrFrame, K, D,
+                    cv::Point3d(armorOrigin_cam[0], armorOrigin_cam[1], armorOrigin_cam[2]),
+                    R_cam_from_armor, targetAxisLenMm * 1.7, 2, 0.45, false, true);
+
+    // 目标系三轴：粗线，画在装甲板系之上
+    drawAxesAtPoint(bgrFrame, K, D, cv::Point3d(p_cam[0], p_cam[1], p_cam[2]),
+                    R_cam_from_target, targetAxisLenMm, 2, 0.6);
+
+    // ---- ④ 末端系（带黑描边），并显示它和目标系的差值 ----
+    // 用途：把"视觉想让它摆成什么样（目标系）"和"它现在实际是什么样（末端系）"
+    // 放在同一张图上，姿态差多少一眼能看出来。
+    double dPosMm = -1.0, dAngDeg = -1.0;
+    if (extra.ok)
+    {
+        // 差值先算：即使末端原点跑到画面外（或相机后方），这两个数依然有参考价值
+        {
+            const cv::Vec3d d = extra.t_frame_in_car -
+                                cv::Vec3d(target.point[0], target.point[1], target.point[2]);
+            dPosMm = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            // 姿态夹角：两个系之间的最小旋转角（欧拉角不能逐轴相减，只能这样算）
+            const cv::Matx33d dR = extra.R_car_from_frame.t() * target.R_car_from_target;
+            const double tr = dR(0, 0) + dR(1, 1) + dR(2, 2);
+            dAngDeg = std::acos(std::max(-1.0, std::min(1.0, (tr - 1.0) * 0.5))) * 180.0 / CV_PI;
+        }
+
+        const cv::Matx33d R_cam_from_extra = R_cam_from_car * extra.R_car_from_frame;
+        const cv::Vec3d e_cam = R_cam_from_car * extra.t_frame_in_car + t_car_in_cam;
+        if (e_cam[2] > 1.0)   // 原点在相机后方就不画三轴（投影会翻）
+        {
+            drawAxesAtPoint(bgrFrame, K, D, cv::Point3d(e_cam[0], e_cam[1], e_cam[2]),
+                            R_cam_from_extra, targetAxisLenMm * 1.25, 4, 0.5,
+                            false, false, true);
+
+            // 末端原点到目标点的连线，直观看出还差多远
+            std::vector<cv::Point3f> seg{
+                cv::Point3f((float)e_cam[0], (float)e_cam[1], (float)e_cam[2]),
+                cv::Point3f((float)p_cam[0], (float)p_cam[1], (float)p_cam[2])};
+            std::vector<cv::Point2f> segUV;
+            cv::projectPoints(seg, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 0), cv::Mat(K), D, segUV);
+            for (int k = 0; k < 16; k += 2)   // 白色虚线
+            {
+                const cv::Point2f a = segUV[0] + (segUV[1] - segUV[0]) * (k / 16.f);
+                const cv::Point2f b = segUV[0] + (segUV[1] - segUV[0]) * ((k + 1) / 16.f);
+                cv::line(bgrFrame, a, b, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+            }
+
+            // 标签用半透明底板，压在箭头上也读得清
+            drawTextPanel(bgrFrame, {extra.label + " O"}, cv::Point(cvRound(segUV[0].x) + 10,
+                          cvRound(segUV[0].y) + 18), 0.5, 22, cv::Scalar(255, 255, 255));
+        }
+    }
+
+    // 偏置量放到左下角固定位置，避免和装甲板 +Y 轴（朝图像下方）的箭头撞在一起
+    char off[160];
+    std::snprintf(off, sizeof(off), "offset in armor frame: (%.1f, %.1f, %.1f) mm",
+                  mPoint[0], mPoint[1], mPoint[2]);
+    cv::putText(bgrFrame, off, cv::Point(10, bgrFrame.rows - 34),
+                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+
+    // ---- ③ 左上角：实时欧拉角 + 与上一帧的变化量 ----
+    {
+        const cv::Vec3d rpyRad = rpyFromR(target.R_car_from_target);
+        const double k = 180.0 / CV_PI;
+        const double roll = rpyRad[0] * k, pitch = rpyRad[1] * k, yaw = rpyRad[2] * k;
+
+        // 与上一帧比较：帧间抖动/漂移一眼可见；超过 1s 未更新或上次失败则不算变化量
+        static cv::Vec3d prev;
+        static bool havePrev = false;
+        static auto prevTp = std::chrono::steady_clock::now();
+        const auto nowTp = std::chrono::steady_clock::now();
+        const bool fresh = havePrev &&
+                           (nowTp - prevTp) < std::chrono::milliseconds(1000);
+        const cv::Vec3d d = fresh ? cv::Vec3d(roll - prev[0], pitch - prev[1], yaw - prev[2])
+                                  : cv::Vec3d(0, 0, 0);
+
+        char l0[128], l1[128], l2[128];
+        std::snprintf(l0, sizeof(l0), "roll  %+8.3f deg", roll);
+        std::snprintf(l1, sizeof(l1), "pitch %+8.3f deg", pitch);
+        std::snprintf(l2, sizeof(l2), "yaw   %+8.3f deg", yaw);
+        char l3[128], l4[128];
+        std::snprintf(l3, sizeof(l3), "d/frame %+6.2f %+6.2f %+6.2f",
+                      d[0], d[1], d[2]);
+        std::snprintf(l4, sizeof(l4), "err   %.2f px", target.errMeanPx);
+
+        drawTextPanel(bgrFrame, {l0, l1, l2, l3, l4}, cv::Point(10, 26), 0.62, 26,
+                      cv::Scalar(0, 255, 255));
+
+        // 双解诊断：gap 小 = 两解难分，此时姿态最容易在两簇之间跳
+        char l5[128];
+        if (target.solGapPx < 0.0)
+            std::snprintf(l5, sizeof(l5), "sol   single solution");
+        else
+            std::snprintf(l5, sizeof(l5), "sol   gap %.2f px  %s", target.solGapPx,
+                          target.solAmbiguous ? "AMBIGUOUS(temporal)" : "clear");
+        const cv::Scalar solColor = target.solAmbiguous ? cv::Scalar(0, 0, 255)
+                                                       : cv::Scalar(0, 255, 0);
+        drawTextPanel(bgrFrame, {l5}, cv::Point(10, 26 + 26 * 5), 0.62, 26, solColor);
+
+        // 末端系 vs 目标系：位置差(mm) + 姿态夹角(deg)，小于阈值显示绿、否则黄
+        char l6[160];
+        if (dAngDeg >= 0.0)
+        {
+            std::snprintf(l6, sizeof(l6), "%s vs target: dpos %.1f mm  dang %.2f deg",
+                          extra.label.c_str(), dPosMm, dAngDeg);
+            const cv::Scalar c6 = (dAngDeg < 5.0 && dPosMm < 20.0) ? cv::Scalar(0, 255, 0)
+                                                                  : cv::Scalar(0, 220, 255);
+            drawTextPanel(bgrFrame, {l6}, cv::Point(10, 26 + 26 * 6), 0.62, 26, c6);
+        }
+
+        prev = cv::Vec3d(roll, pitch, yaw);
+        havePrev = true;
+        prevTp = nowTp;
+    }
+
+    // 图例：说明 in/out 与两种线宽的含义（Hershey 字体不能写中文，这里用英文）
+    cv::putText(bgrFrame, "axis: X=red  Y=green  Z=blue   'in' = into screen (away)   'out' = toward viewer",
+                cv::Point(10, bgrFrame.rows - 12), cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+    cv::putText(bgrFrame, "solid = target frame    dashed = armor frame",
+                cv::Point(10, bgrFrame.rows - 60), cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+
+    // 目标点名 + 车系坐标：放到左下角，不再压在目标系三轴上
+    char info[160];
+    std::snprintf(info, sizeof(info), "target frame in car: (%.0f, %.0f, %.0f) mm",
+                  p_car[0], p_car[1], p_car[2]);
+    cv::putText(bgrFrame, info, cv::Point(10, bgrFrame.rows - 78),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
 }
 
 // ============================================================================
@@ -762,19 +1383,14 @@ CarTargetPose toCarTargetPose(const CarTarget &t)
     out.reason = t.reason;
     out.errMeanPx = t.errMeanPx;
     out.vec = t.vec;
-    out.R = t.R_armor_to_car;
+    out.solGapPx = t.solGapPx;
+    out.solAmbiguous = t.solAmbiguous;
+    out.R = t.R_car_from_target;
     if (!t.ok)
         return out;
 
-    // 目标系 = 装甲板系把 Y 轴取反：
-    //   R_target_in_car = R_armor_in_car * diag(1, -1, 1)
-    // 右乘 diag(1,-1,1) 的效果就是"只把旋转矩阵第 2 列取反"。
-    // ★ 它自身的 det = -1，和 CarTargetOptions::R_car_from_cam（det 也是 -1）配对，
-    //   相乘后 out.R 的 det 为 +1，才是 rpyFromR 能接受的纯旋转。
-    const cv::Matx33d kFlipY(1, 0, 0,
-                             0, -1, 0,
-                             0, 0, 1);
-    out.R = t.R_armor_to_car * kFlipY;
+    // 目标系 = 装甲板系右乘 R_armor_from_target：X 取反，Y/Z 互换后取反
+    out.R = t.R_car_from_target;
 
     // 平移部分：目标系原点就是目标点本身
     out.pose[0] = t.point[0];
@@ -820,7 +1436,7 @@ CarTarget PnPTuner::add(const cv::Mat &bgrFrame, const PnPDate &data)
         return out;
 
     const cv::Matx33d K = data.cameraMatrix;
-    const cv::Matx33d R = det.R_armor_to_cam;
+    const cv::Matx33d R = det.R_cam_from_armor;
 
     for (size_t k = 0; k < points2D.size(); ++k)
     {

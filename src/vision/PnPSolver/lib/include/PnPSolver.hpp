@@ -20,16 +20,28 @@
 //
 //  目标系（"目标坐标系"）定义：
 //      原点 = 目标点（即 CarTarget::point，不是装甲板原点）
-//      Z 轴 = 垂直装甲板平面（与装甲板系 Z 同向）
-//      X 轴 = 与装甲板系 X 同向
-//      Y 轴 = 与装甲板系 Y 反向
-//    数学上：R_target_in_car = R_armor_in_car * diag(1, -1, 1)
-//    注：该矩阵 det = -1，与 CarTargetOptions::R_car_from_cam（同为 det = -1）配对，
-//        相乘后 out.R 才是纯旋转（det = +1）。
+//      三个轴以装甲板系为参考（B = R_armor_from_target，见 CarTargetOptions）：
+//          X 轴 = -装甲板系 X 轴
+//          Y 轴 = -装甲板系 Z 轴
+//          Z 轴 = -装甲板系 Y 轴
+//    也就是装甲板的 Y/Z 互换后都取反，X 也取反；等价于绕装甲板系
+//    (0, 1, -1)/√2 轴转 180°（det = +1，仍是右手系）。
+//    合成关系：R_car_from_target = R_car_from_armor * R_armor_from_target
+//    原点不变，因此目标朝向相对装甲板整体翻转 180°。
+//
+//  ★ 旋转矩阵统一命名规则：R_<输出系>_from_<输入系>
+//      语义：把【输入系】下的向量变到【输出系】下。左乘作用，可链式相乘，
+//            相邻的中间系会抵消：
+//                R_car_from_target = R_car_from_armor * R_armor_from_target
+//                                    └── 输出 car ──┘ └ 中间 armor 抵消 ┘
+//      三列含义：R_A_from_B 的三列 = B 系三轴在 A 系下的方向。
+//      上一版用的是 <来源>_to_<去向>（如 R_armor_to_car），前缀一会儿是来源、
+//      一会儿是去向，在同一行里混用极易写反，已全部统一到本规则。
 // ============================================================================
 #pragma once
 
 #include <opencv2/opencv.hpp>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -43,12 +55,25 @@ struct CarTarget
     cv::Vec3d point = cv::Vec3d(0, 0, 0); // ★ 目标点   (mm, 车体系)
     cv::Vec3d vec = cv::Vec3d(0, 0, 0);   // ★ 目标向量     (车体系)
 
+    // 目标点在装甲板系下的坐标：p_target_armor（即 PnPDate::m_point）
+    // 目标点（目标系原点）在车体系下：
+    //   point = R_car_from_armor * p_target_armor + t_armor_in_car
     // 装甲板系 -> 车体系 的旋转矩阵（列 = 装甲板三轴在车体系下的方向）
-    cv::Matx33d R_armor_to_car = cv::Matx33d::eye();
+    cv::Matx33d R_car_from_armor = cv::Matx33d::eye();
+
+    // 目标系 -> 车体系 的旋转矩阵（列 = 目标系三轴在车体系下的方向）
+    //   R_car_from_target = R_car_from_armor * R_armor_from_target
+    //   R_armor_from_target = [[-1,0,0],[0,0,-1],[0,-1,0]]：
+    //   X 目标 = -X 装甲板，Y 目标 = -Z 装甲板，Z 目标 = -Y 装甲板
+    cv::Matx33d R_car_from_target = cv::Matx33d::eye();
 
     double errMeanPx = -1.0; // 本帧反投影误差 (px)，未解出时为 -1
     bool ok = false;         // 是否解算成功
     std::string reason;      // ok == false 的原因
+
+    // ---- IPPE 选解诊断 ----
+    double solGapPx = -1.0;  // 最优与次优解的重投影误差差 (px)；只有一个解时为 -1
+    bool solAmbiguous = false; // 两解误差落在 solErrMarginPx 之内（靠连续性判据决出）
 };
 
 // ----------------------------------------------------------------------------
@@ -57,20 +82,46 @@ struct CarTarget
 struct CarTargetOptions
 {
     // 相机系 -> 车体系（左乘在装甲板位姿上）
-    // 车体系即 base_link，轴向：x 左、y 前、z 上
-    // 本矩阵的三列 = 相机三个轴在车系下的方向：
-    //   cam_x（图像向右） -> (-1, 0, 0)  即车体右侧
-    //   cam_y（图像向下） -> ( 0, 0,-1)  即车体下方
-    //   cam_z（光轴）     -> ( 0, 1, 0)  即车体正前方 ← 光轴朝前
-    // ★ 注意 det = -1：正交但不是纯旋转（左右手系互换）。
-    //   它与 toCarTargetPose() 里的 diag(1,-1,1)（det 同为 -1）配对使用，
-    //   相乘后 out.R 的 det 才是 +1；单独改动其中任何一个都会让欧拉角失效。
-    cv::Matx33d R_car_from_cam = cv::Matx33d(-1, 0,  0,
+    // 车体系即 base_link，轴向：x 右、y 前、z 上（右手系，由 URDF 实测确认）
+    // 按你的定义：
+    //   cam_x -> car_x
+    //   cam_y -> -car_z
+    //   cam_z -> car_y
+    // 因此本矩阵的三列 = 相机三个轴在车系下的方向：
+    //   cam_x（图像向右） -> ( 1, 0, 0)  即车体 +x = 右
+    //   cam_y（图像向下） -> ( 0, 0,-1)  即车体 -z = 下
+    //   cam_z（光轴）     -> ( 0, 1, 0)  即车体 +y = 前 ← 光轴朝前
+    // 这版矩阵满足你当前定义的右手系要求。
+    cv::Matx33d R_car_from_cam = cv::Matx33d( 1, 0,  0,
                                                0, 0,  1,
                                                0, -1, 0);
     // 车体原点 -> 相机光心 (mm)，顺序与车体系 (x, y, z) 一致：
-    // 左 72.83 / 后 492.4 / 上 726.45（y 轴朝前，取负表示光心在原点后方）
+    // 右 72.83 / 后 492.4 / 上 726.45（y 轴朝前，取负表示光心在原点后方）
     cv::Vec3d t_cam_in_car = cv::Vec3d(72.83, -492.4, 726.45);
+
+    // 目标系 -> 装甲板系 的固定旋转（列 = 目标三轴在装甲板系下的方向）：
+    //   X 目标 = -X 装甲板
+    //   Y 目标 = -Z 装甲板
+    //   Z 目标 = -Y 装甲板
+    // 即 X 取反、Y/Z 互换后取反；等价于绕装甲板系 (0, 1, -1)/√2 轴转 180°，
+    // det = +1，仍是右手系。
+    cv::Matx33d R_armor_from_target = cv::Matx33d(-1,  0,  0,
+                                                   0,  0, -1,
+                                                   0, -1,  0);
+
+    // ---- IPPE 平面二义性的选解约束 ----
+    // IPPE 对共面点必然给出 2 个解，实测两解姿态差 27~30°，而重投影误差只差 0.3~0.5 px。
+    // 只按"平均重投影误差最小"挑，余量太薄，噪声一变就可能翻解（姿态瞬间跳几十度）。
+    // 规则：误差差距超过 solErrMarginPx 时按误差取（清晰胜出）；
+    //       差距在 margin 之内视为"打平"，此时用上一帧姿态做连续性判据（迟滞），
+    //       避免在两簇之间来回跳。
+    bool useTemporalPrior = true;   // 打平时用上一帧姿态选解
+    double solErrMarginPx = 1.0;    // 误差差多少 px 以内算"打平"
+    double priorMaxAgeSec = 2.0;    // 上一帧姿态超过这么久就作废
+
+    // 物理约束：装甲板 +Z 是板法向，正面朝相机时其相机系 z 分量必须 < 0。
+    // 只用来剔除"板翻到背面"这种物理上不可能的解；两个解都朝相机时不起作用。
+    bool requireNormalTowardCamera = true;
 
     bool refineWithLM = false; // IPPE 之后再做一步 LM 精修
 };
@@ -110,16 +161,23 @@ struct CarTargetPose
     // pose[0..2] = 目标点 (x, y, z)，mm，车体系
     // pose[3..5] = 姿态 (roll, pitch, yaw)，rad，ZYX 顺序：
     //              R = Rz(yaw) * Ry(pitch) * Rx(roll)
+    // 目标系原点 = 目标点，姿态 = 装甲板姿态 · R_armor_from_target：
+    //   R_car_from_target = R_car_from_armor * [[-1,0,0],[0,0,-1],[0,-1,0]]
+    // 此处的 pose 记录目标系原点在车体系下的位置，R 则记录目标系在车体系下的定向。
     cv::Vec6d pose = cv::Vec6d(0, 0, 0, 0, 0, 0);
 
     cv::Vec3d vec = cv::Vec3d(0, 0, 0); // ★ 目标向量（车体系）
 
     // 目标系 -> 车体系 的旋转矩阵，与 pose[3..5] 一定是同一个姿态
+    //   R_car_from_target = R_car_from_armor * [[-1,0,0],[0,0,-1],[0,-1,0]]
     cv::Matx33d R = cv::Matx33d::eye();
 
     double errMeanPx = -1.0; // 本帧反投影误差 (px)，未解出时为 -1
     bool ok = false;         // 是否解算成功
     std::string reason;      // ok == false 的原因
+
+    double solGapPx = -1.0;    // 最优/次优解重投影误差差 (px)，透传自 CarTarget
+    bool solAmbiguous = false; // 本帧两解是否"打平"
 
     // ★ 两级索引（只有两个索引号）：
     //     r[0]  -> 六自由度  [x, y, z, roll, pitch, yaw]
@@ -151,6 +209,62 @@ CarTargetPose toCarTargetPose(const CarTarget &t);
 
 // 图像 -> 8 个角点。顺序：左条 左上→左下→右下→右上，右条同样（屏幕逆时针）
 bool detectCorners(const cv::Mat &bgrFrame, std::vector<cv::Point2f> &points2D);
+
+// ----------------------------------------------------------------------------
+//  ★ 调参接口：红蓝通道相减二值化的差分阈值（运行时可用滑条实时改）
+//
+//      mask = (R - B) > 差分阈值
+//
+//  默认值即库里的固定常量（差分 70）；滑条调好后把结果写回默认值即可。
+//  线程安全：相机线程每帧读一次，滑条回调在 GUI 线程写，互不阻塞。
+// ----------------------------------------------------------------------------
+int binaryDiffThreshold();                    // 当前 R-B 差分阈值（0~255）
+void setBinaryDiffThreshold(int diffThreshold); // 入参自动夹到 0~255
+
+// ----------------------------------------------------------------------------
+//  一次检测的全部中间量，给调参/可视化用（生产路径不产生任何额外开销）
+// ----------------------------------------------------------------------------
+struct DetectDebug
+{
+    cv::Mat mask;                                 // 红蓝差分二值图（CV_8UC1）
+    std::vector<std::vector<cv::Point>> contours; // 二值图上的外轮廓（与检测内部同一份）
+    std::vector<cv::Point2f> points2D;            // 8 个角点，顺序同 points3D
+    std::vector<std::array<cv::Point2f, 4>> bars; // 每根光条"梯形拟合"出的 4 个角点
+    bool ok = false;                              // 是否凑齐 2 根光条并给出 8 个角点
+    std::string reason;                           // ok == false 的原因
+};
+
+// 图像 -> 8 个角点，并把二值图 / 轮廓 / 梯形拟合结果一并带出来
+bool detectCornersDebug(const cv::Mat &bgrFrame, DetectDebug &dbg);
+
+// ----------------------------------------------------------------------------
+//  ★ 调试：在图像上画两个坐标系，用来肉眼核对 xyz 方向
+//
+//    ① base_link：画在画面【右下角】的方位指示器。
+//       base_link 原点在相机上方几百 mm、前方仅几百 mm，投影落在画面外，
+//       所以用正交投影画"三根轴朝哪"（等价于站在相机位置看过去）。
+//       轴基本垂直纸面时画成圆点：实心=朝向观察者，空心=背离观察者。
+//    ② 目标系：画在【识别出的目标点】上，走真实透视投影，轴长 targetAxisLenMm。
+//
+//    ③ 装甲板系：虚线，画在装甲板原点
+//    ④ 末端系（可选）：给 ok=true 才画，带黑描边，并额外显示它和目标系的
+//       位置差 / 姿态夹角，用来直接对比"视觉解算的目标姿态"和"末端实际姿态"。
+//
+//  颜色固定：X=红、Y=绿、Z=蓝。target.ok == false 时只画 ①。
+// ----------------------------------------------------------------------------
+// 额外要叠加到画面上的一个坐标系（典型用法：末端 TCP）
+struct ExtraFrame
+{
+    bool ok = false;                                  // false = 不画
+    cv::Matx33d R_car_from_frame = cv::Matx33d::eye(); // 该系在车系下的姿态（列 = 三轴在车系下的方向）
+    cv::Vec3d t_frame_in_car = cv::Vec3d(0, 0, 0);     // 该系原点在车系下的坐标 (mm)
+    std::string label = "tcp";                         // 原点旁的标签文字
+};
+
+void drawFrameOverlay(cv::Mat &bgrFrame, const PnPDate &data, const CarTarget &target,
+                      const CarTargetOptions &opt = CarTargetOptions(),
+                      double targetAxisLenMm = 100.0, int gizmoSize = 55,
+                      const ExtraFrame &extra = ExtraFrame());
 
 // 8 个角点 -> 目标点 + 目标向量
 CarTarget solveCarTargetFromCorners(const std::vector<cv::Point2f> &points2D,

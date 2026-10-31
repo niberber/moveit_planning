@@ -15,13 +15,16 @@ static    cv::Mat cameraMatrix;
     // 畸变系数 1x5：[k1 k2 p1 p2 k3]
 static   std::vector<double> distCoeffs;
 
-    // 三维世界坐标，8 个点，单位：毫米
+    // 8 个角点的三维坐标（装甲板系，mm），顺序：左条 TL/BL/BR/TR + 右条 TL/BL/BR/TR，
+    // 与 detectCorners() 输出的 points2D 一一对应
 static    std::vector<cv::Point3f> points3D;
 
-   // 柱子的在装甲板系下的坐标
+    // 目标点（柱子/插入点）在【装甲板系】下的坐标，mm：
+    //   point_car = R_car_from_armor * m_point + t_armor_in_car
 static    cv::Point3f m_point;
 
-  //兑矿点需要推的向量表示
+    // 目标向量在【装甲板系】下的表示，mm（纯方向，只旋转不平移）：
+    //   vec_car = R_car_from_armor * v
 static    cv::Vec3d v;
 
 };

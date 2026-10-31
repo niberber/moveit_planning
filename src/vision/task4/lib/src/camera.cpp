@@ -53,7 +53,7 @@ namespace
     // 把 SDK 输出的一帧转成 BGR 三通道的 cv::Mat（out 自己持有内存，
     // 调用方随后 FreeImageBuffer 也不会影响它）。
     // ★ 注意：Bayer RG 转出来必须是 BGR，不能是 RGB，
-    //   PnPSolver 内部按 COLOR_BGR2HSV 做颜色阈值，通道一反就检不到光条。
+    //   PnPSolver 内部按 "R - B" 通道差分做二值化，通道顺序一反就检不到光条。
     bool to_bgr(const MV_FRAME_OUT_INFO_EX &info, const void *data, cv::Mat &out)
     {
         const int w = static_cast<int>(info.nWidth);
@@ -149,27 +149,62 @@ void CameraControl::open_camera()
     }
 }
 
-// 曝光增益设置
+// 曝光增益设置：先关闭自动曝光/自动增益，再手动写入固定值，并读回确认
 void CameraControl::set_exposuregain(int exposureTime, int gain)
 {
-    int nRet3 = MV_CC_SetExposureTime(m_handle, exposureTime);
-    if (nRet3 != MV_OK)
+    if (m_handle == nullptr)
     {
-        std::cerr << "Failed to set exposure time, error code: " << nRet3 << std::endl;
-    }
-    else
-    {
-        std::cout << "Exposure time set successfully." << std::endl;
+        std::cerr << "Camera handle is null; cannot set exposure/gain." << std::endl;
+        return;
     }
 
-    int nRet4 = MV_CC_SetGain(m_handle, gain);
-    if (nRet4 != MV_OK)
+    // 关闭自动曝光和自动增益，避免相机在后台自动补偿回到亮图
+    int ret = MV_CC_SetEnumValue(m_handle, "ExposureAuto", 0);
+    if (ret != MV_OK)
     {
-        std::cerr << "Failed to set gain, error code: " << nRet4 << std::endl;
+        std::cerr << "Failed to disable Auto Exposure, error code: " << ret << std::endl;
+    }
+
+    ret = MV_CC_SetEnumValue(m_handle, "GainAuto", 0);
+    if (ret != MV_OK)
+    {
+        std::cerr << "Failed to disable Auto Gain, error code: " << ret << std::endl;
+    }
+
+    // 手动设置曝光和增益
+    ret = MV_CC_SetExposureTime(m_handle, exposureTime);
+    if (ret != MV_OK)
+    {
+        std::cerr << "Failed to set exposure time, error code: " << ret << std::endl;
     }
     else
     {
-        std::cout << "Gain set successfully." << std::endl;
+        std::cout << "Exposure time set successfully: " << exposureTime << " us" << std::endl;
+    }
+
+    ret = MV_CC_SetGain(m_handle, gain);
+    if (ret != MV_OK)
+    {
+        std::cerr << "Failed to set gain, error code: " << ret << std::endl;
+    }
+    else
+    {
+        std::cout << "Gain set successfully: " << gain << " dB" << std::endl;
+    }
+
+    // 读回当前参数，确认相机确实接受了设置
+    MVCC_FLOATVALUE current_exposure{};
+    ret = MV_CC_GetExposureTime(m_handle, &current_exposure);
+    if (ret == MV_OK)
+    {
+        std::cout << "Current exposure = " << current_exposure.fCurValue << " us" << std::endl;
+    }
+
+    MVCC_FLOATVALUE current_gain{};
+    ret = MV_CC_GetGain(m_handle, &current_gain);
+    if (ret == MV_OK)
+    {
+        std::cout << "Current gain = " << current_gain.fCurValue << " dB" << std::endl;
     }
 }
 
