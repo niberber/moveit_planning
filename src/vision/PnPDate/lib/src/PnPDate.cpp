@@ -1,14 +1,14 @@
 #include <opencv2/opencv.hpp>
 #include "PnPDate.hpp"
 
-cv::Mat PnPDate::cameraMatrix = (cv::Mat_<double>(3, 3) << 1207.1, 0.0, 748.6,
-                                 0.0, 1207.2, 563.7,
+cv::Mat PnPDate::cameraMatrix = (cv::Mat_<double>(3, 3) << 1207.2, 0.0, 748.3,
+                                 0.0, 1207.3, 563.8,
                                  0.0, 0.0, 1.0);
 
 // 顺序与 OpenCV 一致：[k1, k2, p1, p2, k3]
 // 径向 k1=-0.0941, k2=0.0848；切向 p1=0.3683e-3, p2=-0.0242e-3（注意 MATLAB 界面上的 10^-3 倍率）
 // k3 未标定，填 0（若标定结果给出非零 k3 要补到第 5 位）
-std::vector<double> PnPDate::distCoeffs = {-0.0941, 0.0848, 0.0003683, -0.0000242, 0.0};
+std::vector<double> PnPDate::distCoeffs = {-0.0940, 0.0844, 0.0004032, -0.00000846, 0.0};
 
 // ---------------------------------------------------------------------------
 //  points3D 调整记录（PnPTuner 建议，2026-10-31）

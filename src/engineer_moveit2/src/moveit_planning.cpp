@@ -1121,7 +1121,7 @@ static void start_execution(const std::vector<std::vector<float> >& traj){
 // ==================== 视觉接口：海康相机 + PnP ====================
 // 相机参数（按现场调整）
 static const int VISION_CAM_INDEX   = 0;      // 相机序列索引（枚举到的第几台）
-static const int VISION_EXPOSURE_US = 2000;   // 曝光时间(us)
+static const int VISION_EXPOSURE_US = 1500;   // 曝光时间(us)
 static const int VISION_GAIN_DB     = 15;     // 信号放大增益(dB)
 static const int VISION_BUFFER_NUM  = 2;      // 图像缓存节点数
 
@@ -1288,6 +1288,7 @@ static VisionTarget vision_locate()
     const cv::Vec3d vec3  = r[1];   // 6~8: 目标向量
 
     t.p   = Eigen::Vector3d(pose6[0], pose6[1], pose6[2]) / 1000.0;  // mm -> m
+    t.p.z() -= 0.2;                                      // z 固定偏置补偿
     t.rpy = Eigen::Vector3d(pose6[3], pose6[4], pose6[5]);           // rad
     t.v   = Eigen::Vector3d(vec3[0], vec3[1], vec3[2]);
     t.err = r.errMeanPx;
