@@ -8,15 +8,29 @@
 //      if (!r.ok) { /* r.reason 里有原因 */ }
 //
 //      r[0]        // ★ 六自由度 [x, y, z, roll, pitch, yaw]
-//      r[1]        // ★ 三自由度向量 [x, y, z]
+//      r[1]        // ★ 目标向量 1（= PnPDate::v1，车体系）
+//      r[2]        // ★ 目标向量 2（= PnPDate::v2，车体系）
+//
+//  注：v1 是后来插到中间的新量；【原来的】目标向量（旧 PnPDate::v）现在是 r[2]，
+//      按老代码语义调用第二返回值的调用方要改成取 r[2]。
 //
 //      r[0][0..2]  // 目标点在车体系下的坐标 (mm)
 //      r[0][3..5]  // 姿态 roll / pitch / yaw (rad)
-//      r[1][0..2]  // 目标向量在车体系下的表示
+//      r[1][0..2]  // 目标向量 1 在车体系下的表示
+//      r[2][0..2]  // 目标向量 2 在车体系下的表示
 //
 //      cv::Vec6d p6 = r[0];     // 也可以直接转成定长向量
 //      cv::Vec3d p3 = r[1];
+//      cv::Vec3d p3b = r[2];
 //      r.rpyDeg();              // 姿态换成角度 (deg)
+//
+//  ★ 本帧解无效（机械臂遮挡、光条没凑齐、重投影误差/内点数不达标）时：
+//      r.ok       仍为 true（调用方照常可用，规划不会因此中断）
+//      r.held     true，表示 r[0] / r[1] / r[2] 全部取自最近一次有效解
+//      r.heldAgeSec  那份有效解距今多少秒（只作诊断，不限制沿用）
+//      r.stampSec    仍是【当前帧】的时间戳
+//    沿用没有时间上限：一直用到出现新的有效解，或调用 resetLastValidPose()；
+//    只有在"从来没有过有效解"时才退回 r.ok == false。
 //
 //  目标系（"目标坐标系"）定义：
 //      原点 = 目标点（即 CarTarget::point，不是装甲板原点）
@@ -52,8 +66,9 @@
 // ----------------------------------------------------------------------------
 struct CarTarget
 {
-    cv::Vec3d point = cv::Vec3d(0, 0, 0); // ★ 目标点   (mm, 车体系)
-    cv::Vec3d vec = cv::Vec3d(0, 0, 0);   // ★ 目标向量     (车体系)
+    cv::Vec3d point = cv::Vec3d(0, 0, 0); // ★ 目标点     (mm, 车体系)
+    cv::Vec3d vec1 = cv::Vec3d(0, 0, 0);  // ★ 目标向量 1 (车体系) = R_car_from_armor * PnPDate::v1
+    cv::Vec3d vec2 = cv::Vec3d(0, 0, 0);  // ★ 目标向量 2 (车体系) = R_car_from_armor * PnPDate::v2
 
     // 目标点在装甲板系下的坐标：p_target_armor（即 PnPDate::m_point）
     // 目标点（目标系原点）在车体系下：
@@ -74,6 +89,9 @@ struct CarTarget
     // ---- IPPE 选解诊断 ----
     double solGapPx = -1.0;  // 最优与次优解的重投影误差差 (px)；只有一个解时为 -1
     bool solAmbiguous = false; // 两解误差落在 solErrMarginPx 之内（靠连续性判据决出）
+
+    // ---- 有效性判定 ----
+    int inliers = 0; // 内点数 0..8：单点重投影误差 <= inlierErrPx 记 1 个
 };
 
 // ----------------------------------------------------------------------------
@@ -97,7 +115,7 @@ struct CarTargetOptions
                                                0, -1, 0);
     // 车体原点 -> 相机光心 (mm)，顺序与车体系 (x, y, z) 一致：
     // 右 72.83 / 后 492.4 / 上 726.45（y 轴朝前，取负表示光心在原点后方）
-    cv::Vec3d t_cam_in_car = cv::Vec3d(72.83, -492.4, 726.45);
+    cv::Vec3d t_cam_in_car = cv::Vec3d(-72.83, -492.4, 726.45);
 
     // 目标系 -> 装甲板系 的固定旋转（列 = 目标三轴在装甲板系下的方向）：
     //   X 目标 = -X 装甲板
@@ -115,35 +133,45 @@ struct CarTargetOptions
     // 规则：误差差距超过 solErrMarginPx 时按误差取（清晰胜出）；
     //       差距在 margin 之内视为"打平"，此时用上一帧姿态做连续性判据（迟滞），
     //       避免在两簇之间来回跳。
-    bool useTemporalPrior = true;   // 打平时用上一帧姿态选解
+    bool useTemporalPrior = true;   // 打平时用上一帧姿态选解（有解就一直沿用）
     double solErrMarginPx = 1.0;    // 误差差多少 px 以内算"打平"
-    double priorMaxAgeSec = 2.0;    // 上一帧姿态超过这么久就作废
 
     // 物理约束：装甲板 +Z 是板法向，正面朝相机时其相机系 z 分量必须 < 0。
     // 只用来剔除"板翻到背面"这种物理上不可能的解；两个解都朝相机时不起作用。
     bool requireNormalTowardCamera = true;
 
     bool refineWithLM = false; // IPPE 之后再做一步 LM 精修
+
+    // ---- 有效性判定：只看位姿的几何合理性（深度/距离） ----
+    // 不用重投影误差/内点数判失效：误差偏大的帧照样用本帧解；
+    // 真正解不出（检测失败 / IPPE 无解）时 ok = false，由 applyHold 沿用最近一次有效解。
+    bool checkValidity = true;
+    double inlierErrPx = 3.0;    // 单点误差小于它算内点（仅统计，不参与判失效）
+    double minDepthMm = 200.0;   // 装甲板在相机前方的最短距离，防止解到相机背后
+    double maxRangeMm = 8000.0;  // 目标点距离上限，防止解飞
+
+    // ---- 本帧无效时保持最近一次有效解 ----
+    // 沿用没有时间上限：一直用到出现新的有效解，或调用 resetLastValidPose()。
+    // 换目标/换工位/重新标定时记得 reset，否则会拿上一工位的位姿顶上。
+    bool holdLastValidPose = true;
 };
 
 // ----------------------------------------------------------------------------
-//  ★ 一帧的完整结果：6 自由度位姿 + 目标向量
+//  ★ 一帧的完整结果：6 自由度位姿 + 两个目标向量
 //
 //  为什么不用 std::vector<double> 装？
-//    1) 9 个数的含义只能靠下标记，容易错位；
+//    1) 9 个以上数的含义只能靠下标记，容易错位；
 //    2) 长度可变，编译器帮不上忙；
 //    3) 位姿本身是"3 平移 + 3 姿态"，向量是"3 分量"，分组信息会丢。
-//  为什么不用 std::pair<cv::Vec6d, cv::Vec3d>？
-//    能存，但 .first / .second 读起来不知道是什么，也不能用 r[0] / r[1]。
-//  => 用结构体 + 一个"项"视图：r[0] 是六自由度，r[1] 是三自由度向量，
+//  => 用结构体 + 一个"项"视图：r[0] 是六自由度，r[1] / r[2] 是三自由度向量，
 //     这个项既能再下标（r[0][3]），也能隐式转成 cv::Vec6d / cv::Vec3d。
 // ----------------------------------------------------------------------------
 
-// r[0] / r[1] 取出来的东西（一个 6 维或 3 维的小数组）
+// r[0] / r[1] / r[2] 取出来的东西（一个 6 维或 3 维的小数组）
 struct CarTargetItem
 {
     cv::Vec6d pose = cv::Vec6d(0, 0, 0, 0, 0, 0); // 仅当 n == 6 时有效
-    cv::Vec3d vec = cv::Vec3d(0, 0, 0);           // 仅当 n == 3 时有效
+    cv::Vec3d vec = cv::Vec3d(0, 0, 0);           // 仅当 n == 3 时有效（向量 1 或 2）
     int n = 6;                                    // 6 = 位姿；3 = 向量
 
     int size() const { return n; }
@@ -166,7 +194,8 @@ struct CarTargetPose
     // 此处的 pose 记录目标系原点在车体系下的位置，R 则记录目标系在车体系下的定向。
     cv::Vec6d pose = cv::Vec6d(0, 0, 0, 0, 0, 0);
 
-    cv::Vec3d vec = cv::Vec3d(0, 0, 0); // ★ 目标向量（车体系）
+    cv::Vec3d vec1 = cv::Vec3d(0, 0, 0); // ★ 目标向量 1（车体系）
+    cv::Vec3d vec2 = cv::Vec3d(0, 0, 0); // ★ 目标向量 2（车体系）
 
     // 目标系 -> 车体系 的旋转矩阵，与 pose[3..5] 一定是同一个姿态
     //   R_car_from_target = R_car_from_armor * [[-1,0,0],[0,0,-1],[0,-1,0]]
@@ -179,15 +208,24 @@ struct CarTargetPose
     double solGapPx = -1.0;    // 最优/次优解重投影误差差 (px)，透传自 CarTarget
     bool solAmbiguous = false; // 本帧两解是否"打平"
 
-    // ★ 两级索引（只有两个索引号）：
-    //     r[0]  -> 六自由度  [x, y, z, roll, pitch, yaw]
-    //     r[1]  -> 三自由度向量 [x, y, z]
+    // ★ 有效性判定 / 保持上一帧 ----
+    int inliers = 0;          // 本帧内点数 0..8（透传自 CarTarget）
+    // ★ true = 本帧无效，pose / vec1 / vec2 / R 全部取自最近一次有效解
+    //   此时 ok 仍为 true（调用方照常可用），但要靠 held 区分新旧。
+    bool held = false;
+    double heldAgeSec = 0.0;  // 沿用的那份有效解距今多久 (s)；held == false 时为 0
+    double stampSec = -1.0;   // 本帧时间戳 (s)；held 时也是"当前帧"的时间戳
+
+    // ★ 三级索引（只有三个索引号）：
+    //     r[0]  -> 六自由度   [x, y, z, roll, pitch, yaw]
+    //     r[1]  -> 目标向量 1 [x, y, z]（= PnPDate::v1）
+    //     r[2]  -> 目标向量 2 [x, y, z]（= PnPDate::v2）
     //   再往下一层：
-    //     r[0][0]  -> x (mm)       r[1][0] -> vec.x
-    //     r[0][3]  -> roll (rad)   r[1][2] -> vec.z
+    //     r[0][0]  -> x (mm)       r[1][0] -> vec1.x     r[2][0] -> vec2.x
+    //     r[0][3]  -> roll (rad)   r[1][2] -> vec1.z     r[2][2] -> vec2.z
     //   也可以直接赋给 cv::Vec6d / cv::Vec3d：
-    //     cv::Vec6d p = r[0];      cv::Vec3d v = r[1];
-    //   索引不是 0/1，或内层越界，都会触发 CV_Assert
+    //     cv::Vec6d p = r[0];      cv::Vec3d v1 = r[1];  cv::Vec3d v2 = r[2];
+    //   索引不是 0/1/2，或内层越界，都会触发 CV_Assert
     CarTargetItem operator[](int i) const;
 
     cv::Vec3d rpyDeg() const; // 姿态换成角度，方便打印
@@ -196,8 +234,17 @@ struct CarTargetPose
 // ----------------------------------------------------------------------------
 //  ★ 主函数：一帧图像 -> 6 自由度位姿 + 目标向量
 // ----------------------------------------------------------------------------
+//  stampSec：本帧时间戳 (s)，传 < 0 表示用库内时钟（system_clock）。
+//  本帧无效时返回最近一次有效解的位姿/向量，held = true，stampSec 仍是本帧时间戳。
 CarTargetPose solveCarTargetPose(const cv::Mat &bgrFrame, const PnPDate &data,
-                                 const CarTargetOptions &opt = CarTargetOptions());
+                                 const CarTargetOptions &opt = CarTargetOptions(),
+                                 double stampSec = -1.0);
+
+// 清掉"最近一次有效解"缓存（换目标、重新标定、开始新一次定位时调用）
+void resetLastValidPose();
+
+// 查缓存里还有什么（ok == false 且 reason 说明为空，表示还没有有效解）
+CarTargetPose lastValidPose();
 
 // 由旧的 CarTarget 结果转换（内部就是"补一个 R 再转欧拉角"，不重新解算）
 CarTargetPose toCarTargetPose(const CarTarget &t);

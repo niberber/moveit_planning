@@ -23,8 +23,10 @@ static    std::vector<cv::Point3f> points3D;
     //   point_car = R_car_from_armor * m_point + t_armor_in_car
 static    cv::Point3f m_point;
 
-    // 目标向量在【装甲板系】下的表示，mm（纯方向，只旋转不平移）：
-    //   vec_car = R_car_from_armor * v
-static    cv::Vec3d v;
+static    cv::Vec3d v1;   // 目标向量 1（装甲板系，mm，纯方向只旋转）
+
+    // 目标向量 2 在【装甲板系】下的表示，mm（纯方向，只旋转不平移）：
+    //   vec2_car = R_car_from_armor * v2
+static    cv::Vec3d v2;
 
 };

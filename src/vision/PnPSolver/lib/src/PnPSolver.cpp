@@ -958,19 +958,16 @@ CarTarget poseImpl(const std::vector<cv::Point2f> &points2D, const PnPDate &data
     }
 
     // 上一帧的姿态（用于打平时判定连续性）。跨调用共享，加锁保护；
-    // 超过 priorMaxAgeSec 未更新则视为失效，避免旧姿态把结果锁死。
+    // 不设时间上限：只要有过有效解就一直沿用，直到出现新的有效解。
     static std::mutex priorMtx;
     static cv::Matx33d priorR = cv::Matx33d::eye();
     static bool havePrior = false;
-    static std::chrono::steady_clock::time_point priorTp;
     cv::Matx33d prevR;
     bool usePrev = false;
     if (opt.useTemporalPrior)
     {
         std::lock_guard<std::mutex> lk(priorMtx);
-        const auto age = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - priorTp).count();
-        usePrev = havePrior && age <= opt.priorMaxAgeSec;
+        usePrev = havePrior;
         prevR = priorR;
     }
 
@@ -1051,9 +1048,11 @@ CarTarget poseImpl(const std::vector<cv::Point2f> &points2D, const PnPDate &data
     const cv::Vec3d pointArmor(data.m_point.x, data.m_point.y, data.m_point.z);
     out.point = cv::Vec3d(R_car_from_armor * pointArmor) + t_armor_in_car;
 
-    // ★ 目标向量：自由向量，只旋转不平移
-    const cv::Vec3d vecArmor(data.v[0], data.v[1], data.v[2]);
-    out.vec = cv::Vec3d(R_car_from_armor * vecArmor);
+    // ★ 目标向量：自由向量，只旋转不平移（v1 / v2 用同一个旋转）
+    const cv::Vec3d vec1Armor(data.v1[0], data.v1[1], data.v1[2]);
+    const cv::Vec3d vec2Armor(data.v2[0], data.v2[1], data.v2[2]);
+    out.vec1 = cv::Vec3d(R_car_from_armor * vec1Armor);
+    out.vec2 = cv::Vec3d(R_car_from_armor * vec2Armor);
 
     out.R_car_from_armor = R_car_from_armor;
     out.solGapPx = gap;
@@ -1062,6 +1061,30 @@ CarTarget poseImpl(const std::vector<cv::Point2f> &points2D, const PnPDate &data
     out.R_car_from_target = R_car_from_armor * opt.R_armor_from_target;
 
     out.errMeanPx = det.errMeanPx;
+
+    // ---- 有效性判定：只看位姿几何合理性（深度/距离） ----
+    // 不按重投影误差/内点数判失效：误差偏大的帧照样沿用本帧解，
+    // 真正解不出时 ok = false，由 applyHold 沿用最近一次有效解。
+    // 内点数仍统计（<= inlierErrPx 的角点数），只作诊断。
+    for (size_t k = 0; k < det.reproj.size(); ++k)
+        if (cv::norm(det.reproj[k] - points2D[k]) <= opt.inlierErrPx)
+            ++out.inliers;
+
+    if (opt.checkValidity)
+    {
+        std::string why;
+        if (det.t_armor_in_cam[2] < opt.minDepthMm)
+            why = "装甲板深度 " + std::to_string(det.t_armor_in_cam[2]) + " mm 不合理";
+        else if (cv::norm(det.t_armor_in_cam) > opt.maxRangeMm)
+            why = "目标距离 " + std::to_string(cv::norm(det.t_armor_in_cam)) + " mm 超限";
+
+        if (!why.empty())
+        {
+            out.reason = why;
+            return out; // ok 保持 false，且不更新下面的时序 prior
+        }
+    }
+
     out.ok = true;
 
     // 更新"上一帧姿态"，供下一次选解使用
@@ -1070,7 +1093,6 @@ CarTarget poseImpl(const std::vector<cv::Point2f> &points2D, const PnPDate &data
         std::lock_guard<std::mutex> lk(priorMtx);
         priorR = det.R_cam_from_armor;
         havePrior = true;
-        priorTp = std::chrono::steady_clock::now();
     }
     return out;
 }
@@ -1350,10 +1372,10 @@ CarTargetItem::operator cv::Vec3d() const
     return vec;
 }
 
-// 外层只用两个索引：0 = 六自由度位姿，1 = 三自由度向量
+// 外层只用三个索引：0 = 六自由度位姿，1 = 目标向量 1，2 = 目标向量 2
 CarTargetItem CarTargetPose::operator[](int i) const
 {
-    CV_Assert(i == 0 || i == 1);
+    CV_Assert(i == 0 || i == 1 || i == 2);
 
     CarTargetItem item;
     if (i == 0)
@@ -1363,7 +1385,7 @@ CarTargetItem CarTargetPose::operator[](int i) const
     }
     else
     {
-        item.vec = vec;
+        item.vec = (i == 1) ? vec1 : vec2;
         item.n = 3;
     }
     return item;
@@ -1382,9 +1404,11 @@ CarTargetPose toCarTargetPose(const CarTarget &t)
     out.ok = t.ok;
     out.reason = t.reason;
     out.errMeanPx = t.errMeanPx;
-    out.vec = t.vec;
+    out.vec1 = t.vec1;
+    out.vec2 = t.vec2;
     out.solGapPx = t.solGapPx;
     out.solAmbiguous = t.solAmbiguous;
+    out.inliers = t.inliers;
     out.R = t.R_car_from_target;
     if (!t.ok)
         return out;
@@ -1405,18 +1429,125 @@ CarTargetPose toCarTargetPose(const CarTarget &t)
     return out;
 }
 
-CarTargetPose solveCarTargetPose(const cv::Mat &bgrFrame, const PnPDate &data,
-                                 const CarTargetOptions &opt)
+// ============================================================================
+//  最近一次有效解保持器
+//  只挂在 CarTargetPose 这一层：CarTarget（PnPTuner / 调试绘制）保持每帧真实结果，
+//  免得累计误差统计和 points3D 调整建议被旧数据污染。
+// ============================================================================
+namespace
 {
-    std::vector<cv::Point2f> points2D;
-    std::string reason;
-    if (!detectImpl(bgrFrame, points2D, &reason))
+struct LastValid
+{
+    std::mutex mtx;
+    CarTargetPose pose;
+    std::chrono::steady_clock::time_point tp{};
+    bool have = false;
+
+    // r[2] 独立缓存：源向量是 PnPDate::v2，与 r[1] 用的 PnPDate::v1 不是同一个，
+    // 本帧无有效解时单独沿用它自己的最近历史值
+    cv::Vec3d vec2 = cv::Vec3d(0, 0, 0);
+    bool haveVec2 = false;
+};
+
+LastValid &lastValid()
+{
+    static LastValid lv;
+    return lv;
+}
+
+double nowStamp(double stampSec)
+{
+    if (stampSec >= 0.0)
+        return stampSec; // 调用方给了时间戳（如 ROS 时间）就原样用
+    return std::chrono::duration<double>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// cur = 本帧原始结果（可能 ok == false），stamp = 本帧时间戳
+CarTargetPose applyHold(const CarTargetPose &cur, const CarTargetOptions &opt, double stamp)
+{
+    CarTargetPose out = cur;
+    out.stampSec = stamp;
+
+    if (cur.ok) // 本帧有效：刷新缓存，原样返回
     {
-        CarTargetPose out;
-        out.reason = reason;
+        out.held = false;
+        out.heldAgeSec = 0.0;
+        std::lock_guard<std::mutex> lk(lastValid().mtx);
+        lastValid().pose = out;
+        lastValid().tp = std::chrono::steady_clock::now();
+        lastValid().have = true;
+        lastValid().vec2 = out.vec2; // r[2] 单独缓存
+        lastValid().haveVec2 = true;
         return out;
     }
-    return toCarTargetPose(poseImpl(points2D, data, opt));
+
+    if (!opt.holdLastValidPose)
+        return out; // 不保持：ok 仍为 false，reason 原样
+
+    std::lock_guard<std::mutex> lk(lastValid().mtx);
+
+    // r[2] 从自己的缓存沿用，和位姿/vec1 的历史解分开取
+    if (lastValid().haveVec2)
+        out.vec2 = lastValid().vec2;
+
+    if (!lastValid().have)
+    {
+        out.reason += "（没有可沿用的历史有效解）";
+        return out;
+    }
+
+    const double age = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - lastValid().tp)
+                           .count();
+
+    // 沿用不设时间上限：一直用到出现新的有效解，或调用 resetLastValidPose()
+    CarTargetPose held = lastValid().pose; // ★ pose / vec1 / R 沿用旧值
+    held.vec2 = out.vec2;                  // ★ r[2] 用它自己缓存的历史值
+    held.held = true;
+    held.heldAgeSec = age; // 只作诊断（终端提示 / 上层策略），不参与判失效
+    held.stampSec = stamp; // ★ 时间戳 = 当前帧
+    held.reason = "本帧无效(" + cur.reason + ")，沿用 " + std::to_string(age) +
+                  " s 前的有效解";
+    // errMeanPx / inliers / solGapPx 也随之是旧值，held == true 时不要当本帧精度看
+    return held;
+}
+} // namespace
+
+CarTargetPose solveCarTargetPose(const cv::Mat &bgrFrame, const PnPDate &data,
+                                 const CarTargetOptions &opt, double stampSec)
+{
+    const double stamp = nowStamp(stampSec);
+
+    std::vector<cv::Point2f> points2D;
+    std::string reason;
+    CarTargetPose cur;
+    if (detectImpl(bgrFrame, points2D, &reason))
+        cur = toCarTargetPose(poseImpl(points2D, data, opt));
+    else
+        cur.reason = reason; // 检测阶段失败：无轮廓 / 光条没凑齐 / 间距过小
+
+    return applyHold(cur, opt, stamp);
+}
+
+void resetLastValidPose()
+{
+    std::lock_guard<std::mutex> lk(lastValid().mtx);
+    lastValid().have = false;
+    lastValid().haveVec2 = false; // r[2] 的独立缓存一起清掉
+}
+
+CarTargetPose lastValidPose()
+{
+    std::lock_guard<std::mutex> lk(lastValid().mtx);
+    if (!lastValid().have)
+    {
+        CarTargetPose none;
+        none.reason = "还没有有效解";
+        return none;
+    }
+    return lastValid().pose;
 }
 
 // ============================================================================
@@ -1431,7 +1562,11 @@ CarTarget PnPTuner::add(const cv::Mat &bgrFrame, const PnPDate &data)
         return out;
 
     PoseDetail det;
-    out = poseImpl(points2D, data, CarTargetOptions(), &det);
+    // 调参路径必须能拿到"不达标"的解，否则 points3D 偏差大时永远解不出，
+    // 累积误差一直是 0，调整建议就成了死循环。有效性判定只在对外接口上生效。
+    CarTargetOptions tunerOpt;
+    tunerOpt.checkValidity = false;
+    out = poseImpl(points2D, data, tunerOpt, &det);
     if (!out.ok)
         return out;
 

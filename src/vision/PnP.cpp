@@ -24,7 +24,8 @@ int main()
         return 1;
 
     cv::Vec3d targetPoint; // ★ 交给客户：目标点（车体系, mm）
-    cv::Vec3d targetVec;   // ★ 交给客户：目标向量（车体系）
+    cv::Vec3d targetVec;   // ★ 交给客户：目标向量 1（车体系）
+    cv::Vec3d targetVec2;  // ★ 交给客户：目标向量 2（车体系）
 
     PnPTuner tuner;
 
@@ -38,22 +39,26 @@ int main()
         const CarTargetPose r = toCarTargetPose(t); // 6 自由度位姿 + 目标向量
 
         targetPoint = t.point;
-        targetVec = t.vec;
+        targetVec = t.vec1;
+        targetVec2 = t.vec2;
 
         if (r.ok)
         {
             // r[0] = 六自由度 [x y z roll pitch yaw]
-            // r[1] = 三自由度向量 [x y z]
+            // r[1] = 目标向量 1 [x y z]
+            // r[2] = 目标向量 2 [x y z]
             const cv::Vec6d pose = r[0];
-            const cv::Vec3d vec = r[1];
+            const cv::Vec3d vec1 = r[1];
+            const cv::Vec3d vec2 = r[2];
 
-            std::printf("[%4d] err %.2f px | 点(%.1f, %.1f, %.1f) mm"
+            std::printf("[%4d] err %.2f px%s | 点(%.1f, %.1f, %.1f) mm"
                         " | rpy(%.1f, %.1f, %.1f) deg"
-                        " | vec(%.3f, %.3f, %.3f)\n",
-                        idx, r.errMeanPx,
+                        " | v1(%.3f, %.3f, %.3f) v2(%.3f, %.3f, %.3f)\n",
+                        idx, r.errMeanPx, r.held ? " [沿用旧解]" : "",
                         pose[0], pose[1], pose[2],
                         r.rpyDeg()[0], r.rpyDeg()[1], r.rpyDeg()[2],
-                        vec[0], vec[1], vec[2]);
+                        vec1[0], vec1[1], vec1[2],
+                        vec2[0], vec2[1], vec2[2]);
         }
         else
         {
@@ -75,7 +80,8 @@ int main()
 //     - solveCarTargetPose(frame, data, opt) -> CarTargetPose
 //           pose[0..2] = 目标点 (mm, 车系)      pose[3..5] = roll/pitch/yaw (rad, ZYX)
 //           R          = R_car_from_target = R_car_from_armor * R_armor_from_target
-//           vec        = 目标向量 (车系, mm)
+//           vec1       = 目标向量 1 (车系, mm) = R_car_from_armor * PnPDate::v1
+//           vec2       = 目标向量 2 (车系, mm) = R_car_from_armor * PnPDate::v2
 //     - 单位全程 mm，由上位的 vision_locate() 在出口统一换成 m。
 //     - 目标系定义：原点 = 目标点；X = -装甲板X，Y = -装甲板Z，Z = -装甲板Y
 //       （R_armor_from_target = [[-1,0,0],[0,0,-1],[0,-1,0]]，常量在 CarTargetOptions 里）。

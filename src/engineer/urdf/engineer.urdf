@@ -579,7 +579,7 @@
       link="link10" />
     <axis
       xyz="0 0 -1" />
-    <limit lower = "-1.5708" upper = "1.5708" effort = "100" velocity = "1.0" />
+    <limit lower = "-1.5708" upper = "1.5707963" effort = "100" velocity = "1.0" />
   </joint>
   <link
     name="link11">

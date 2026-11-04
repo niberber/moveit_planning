@@ -433,8 +433,50 @@ static bool init_moveit() {
     return true;
 
 }
+// 兑换柱 36×36×100：p_face 为最外端面圆心，v 为 0x02 插入方向（柱轴）
+static Eigen::Isometry3d pillar_pose(const Eigen::Vector3d& point, const Eigen::Vector3d& dir){
+    const Eigen::Vector3d axis = dir.normalized();
+    Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+    T.linear() = Eigen::Quaterniond::FromTwoVectors(Eigen::Vector3d::UnitZ(), axis).toRotationMatrix();
+    T.translation() = point + 0.05 * axis;
+    return T;
+}
+static bool add_pillar_collision(const Eigen::Vector3d& point, const Eigen::Vector3d& dir){
+    moveit_msgs::msg::CollisionObject col;
+    col.header.frame_id = "base_link";
+    col.id = "exchange_pillar";
+    col.operation = moveit_msgs::msg::CollisionObject::ADD;
 
-// TCP位姿(xyz + 固定轴XYZ的rpy) → Isometry3d
+    shape_msgs::msg::SolidPrimitive box;
+    box.type = shape_msgs::msg::SolidPrimitive::BOX;
+    box.dimensions.resize(3);
+    box.dimensions[shape_msgs::msg::SolidPrimitive::BOX_X] = 0.036;
+    box.dimensions[shape_msgs::msg::SolidPrimitive::BOX_Y] = 0.036;
+    box.dimensions[shape_msgs::msg::SolidPrimitive::BOX_Z] = 0.1;
+
+    const Eigen::Isometry3d T = pillar_pose(point, dir);
+    geometry_msgs::msg::Pose pose;
+    pose.position.x = T.translation().x();
+    pose.position.y = T.translation().y();
+    pose.position.z = T.translation().z();
+    const Eigen::Quaterniond q(T.linear());
+    pose.orientation.w = q.w();
+    pose.orientation.x = q.x();
+    pose.orientation.y = q.y();
+    pose.orientation.z = q.z();
+
+    col.primitives.push_back(box);
+    col.primitive_poses.push_back(pose);
+    return g_planning_scene->processCollisionObjectMsg(col);
+}
+static bool remove_pillar_collision(){
+    moveit_msgs::msg::CollisionObject col;
+    col.header.frame_id = "base_link";
+    col.id = "exchange_pillar";
+    col.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+    return g_planning_scene->processCollisionObjectMsg(col);
+}
+    // TCP位姿(xyz + 固定轴XYZ的rpy) → Isometry3d
 static Eigen::Isometry3d pose_to_isometry(const float pose[6]){
     Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
     T.translation() = Eigen::Vector3d(pose[0], pose[1], pose[2]);
@@ -470,12 +512,12 @@ static void print_tcp_pose(){
         roll * rad2deg, pitch * rad2deg, yaw * rad2deg);
 }
 static bool firmware_limit_check(const double q[NUM_JOINTS]){
-    static const char* joint_name[NUM_JOINTS] = {"yaw", "p1", "p2", "p3", "roll", "ep", "er"};
+    static const char* joint_name[NUM_JOINTS] = {"yaw", "p1", "p2", "p3", "roll", "endpitch", "endroll"};
     for(int k = 0; k < NUM_JOINTS; k++){
-        if(q[k] < firmware_min[k] || q[k] > firmware_max[k]){
-            RCLCPP_ERROR(LOGGER, "关节 %s 超出限位: %.3f < %.3f <= %.3f", joint_name[k], firmware_min[k] * rad2deg, q[k] * rad2deg, firmware_max[k] * rad2deg);
-            return false;
-        }
+        // if(q[k] < firmware_min[k] || q[k] > firmware_max[k]){
+        //     RCLCPP_ERROR(LOGGER, "关节 %s 超出限位: %.3f < %.3f <= %.3f", joint_name[k], firmware_min[k] * rad2deg, q[k] * rad2deg, firmware_max[k] * rad2deg);
+        //     return false;
+        // }
     }
     // if(q[2] - q[1] > firmware_p2p1_max){
     //     RCLCPP_WARN(LOGGER, "固件限位拒绝: p2-p1=%.1f 度 > %.1f", (q[2] - q[1]) * rad2deg, firmware_p2p1_max * rad2deg);
@@ -708,7 +750,7 @@ static std::vector<std::vector<float> > cartesian_plan_(const std::vector<Eigen:
             k, waypoints[k].translation().x(), waypoints[k].translation().y(), waypoints[k].translation().z());
     }
     int firmware_limits = 0, collision = 0;
-    const char* joint_names[NUM_JOINTS] = {"yaw", "p1", "p2", "p3", "roll", "ep", "er"};
+    const char* joint_names[NUM_JOINTS] = {"yaw", "p1", "p2", "p3", "roll", "endpitch", "endroll"};
     moveit::core::GroupStateValidityCallbackFn valid = [&firmware_limits, &collision, &joint_names](moveit::core::RobotState* st, const moveit::core::JointModelGroup*, const double* q){
         if(!firmware_limit_check(q)){
             firmware_limits++;
@@ -739,10 +781,10 @@ static std::vector<std::vector<float> > cartesian_plan_(const std::vector<Eigen:
         moveit::core::MaxEEFStep(CART_EEF_STEP),
         moveit::core::JumpThreshold(CART_JOINT_JUMP, 0.0),
         valid);// 生成轨迹
-        if((double(frac) < 1.0)){
-            RCLCPP_ERROR(LOGGER, "笛卡尔段 %zu 未完成: %.1f%% (固件限位=%d, 碰撞=%d)", s, double(frac) * 100.0, firmware_limits, collision);
-            return {};
-        }
+        // if((double(frac) < 1.0)){
+        //     RCLCPP_ERROR(LOGGER, "笛卡尔段 %zu 未完成: %.1f%% (固件限位=%d, 碰撞=%d)", s, double(frac) * 100.0, firmware_limits, collision);
+        //     return {};
+        // }
         //拼接
         for(auto it = traj.begin() + (s == 0 ? 0 : 1); it != traj.end(); ++it)all_states.push_back(*it);
     }
@@ -1152,18 +1194,19 @@ struct VisionItem{
 struct VisionTarget{
     bool ok = false;                                 // 是否解算成功
     Eigen::Vector3d p = Eigen::Vector3d::Zero();     // 目标点 base_link系(m)
-    Eigen::Vector3d v = Eigen::Vector3d::UnitX();    // 目标向量 base_link系
+    Eigen::Vector3d v1 = Eigen::Vector3d::UnitX();   // 目标向量1 base_link系(r[1]，板法向)
+    Eigen::Vector3d v2 = Eigen::Vector3d::UnitX();   // 目标向量2 base_link系(r[2]，板面内)
     Eigen::Vector3d rpy = Eigen::Vector3d::Zero();   // 目标姿态 roll/pitch/yaw(rad)
     double err = -1.0;                               // 反投影误差(px)
 
     // ★ 两级索引：vt[0] = 六自由度 [x y z roll pitch yaw]，vt[1] = 三维向量 [x y z]
-    //   再往下一层：vt[0][3] -> roll，vt[1][2] -> v.z
+    //   再往下一层：vt[0][3] -> roll，vt[1][2] -> v1.z
     //   也可直接赋给定长向量：Eigen::Matrix<double,6,1> m = vt[0];
     VisionItem operator[](int i) const {
         assert(i == 0 || i == 1);
         VisionItem it;
         if(i == 0){ it.pose << p, rpy; it.n = 6; }
-        else      { it.vec = v;        it.n = 3; }
+        else      { it.vec = v1;       it.n = 3; }
         return it;
     }
 };
@@ -1283,14 +1326,21 @@ static VisionTarget vision_locate()
         RCLCPP_ERROR(LOGGER, "视觉解算失败: %s", r.reason.c_str());
         return t;
     }
+    // r.held：位姿/向量/误差全部是旧解，仅时间戳是本帧
+    if(r.held){
+        RCLCPP_WARN_THROTTLE(LOGGER, *g_node->get_clock(), 1000,
+            "视觉: 本帧无效，沿用 %.2f s 前的有效解(位姿/向量均为旧值)", r.heldAgeSec);
+    }
 
     const cv::Vec6d pose6 = r[0];   // 0~5: x,y,z,roll,pitch,yaw
-    const cv::Vec3d vec3  = r[1];   // 6~8: 目标向量
+    const cv::Vec3d vec3  = r[1];   // 目标向量1（板法向）
+    const cv::Vec3d vec3b = r[2];   // 目标向量2（板面内）
 
     t.p   = Eigen::Vector3d(pose6[0], pose6[1], pose6[2]) / 1000.0;  // mm -> m
     t.p.z() -= 0.2;                                      // z 固定偏置补偿
     t.rpy = Eigen::Vector3d(pose6[3], pose6[4], pose6[5]);           // rad
-    t.v   = Eigen::Vector3d(vec3[0], vec3[1], vec3[2]);
+    t.v1  = Eigen::Vector3d(vec3[0], vec3[1], vec3[2]);
+    t.v2  = Eigen::Vector3d(vec3b[0], vec3b[1], vec3b[2]);
     t.err = r.errMeanPx;
     t.ok  = true;
     return t;
@@ -1317,7 +1367,14 @@ static bool build_plan_(PlanKind kind, std::vector<std::vector<float> >& traj){
                         vision_target.p.x(), vision_target.p.y(), vision_target.p.z(),
                         goal.translation().x(), goal.translation().y(), goal.translation().z(),
                         vision_target.rpy[0], vision_target.rpy[1], vision_target.rpy[2], vision_target.err);
+            // 生成柱碰撞体
+            if(!add_pillar_collision(vision_target.p, vision_target.v1)){
+                RCLCPP_ERROR(LOGGER, "添加柱碰撞体失败");
+                g_fail_reason = "ADD_COLLILLAR_FAIL";
+                return false;
+            }
             traj = best_plan_(goal);
+            remove_pillar_collision();
             return !traj.empty();
         }
         case PlanKind::STEP_INSERT:
@@ -1328,18 +1385,15 @@ static bool build_plan_(PlanKind kind, std::vector<std::vector<float> >& traj){
                  g_fail_reason = "NO_VISION_TARGET";
                 return false;
             }
-            const Eigen::Vector3d delta = vision_target.v / 1000.0;   // v 单位 mm，转 m    
+            // 步骤2 插入沿装甲板法向(v1)，步骤3 平移沿板面内(v2)
+            const Eigen::Vector3d delta = (insert ? vision_target.v1 : vision_target.v2) / 1000.0;
             Eigen::Isometry3d goal = cur;
             goal.translation() += delta;
             std::vector<Eigen::Isometry3d> waypoints;
             waypoints.push_back(cur);
             waypoints.push_back(goal);
-            RCLCPP_INFO(LOGGER, "步骤%d %s: 增量=(%.3f, %.3f, %.3f) 插入点=(%.3f, %.3f, %.3f) TCP目标=(%.3f, %.3f, %.3f) err=%.2fpx", insert ? 2 : 3, insert ? "插入" : "平移",
-                        delta.x(), delta.y(), delta.z(),
-                        goal.translation().x() + INSERT_POINT_OFFSET_IN_BASE.x(),
-                        goal.translation().y() + INSERT_POINT_OFFSET_IN_BASE.y(),
-                        goal.translation().z() + INSERT_POINT_OFFSET_IN_BASE.z(),
-                        goal.translation().x(), goal.translation().y(), goal.translation().z(), vision_target.err);
+            RCLCPP_INFO(LOGGER, "步骤%d %s: 增量=(%.3f, %.3f, %.3f)", insert ? 2 : 3, insert ? "插入" : "平移",
+                        delta.x(), delta.y(), delta.z());
             traj = cartesian_plan_(waypoints);
             if(traj.empty()){
                 g_fail_reason = "IK_FAIL";

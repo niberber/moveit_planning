@@ -25,6 +25,8 @@ std::vector<cv::Point3f> PnPDate::points3D = {{112.44, -72.11, 0.00}, {122.44, 7
 
 cv::Point3f PnPDate::m_point = {0.0,102.22,126.2};
 
-cv::Vec3d PnPDate::v =cv::Vec3d(0.0,-100.0,0.0);
+cv::Vec3d PnPDate::v1 = cv::Vec3d(0.0, 0.0, -100.0);
+cv::Vec3d PnPDate::v2 = cv::Vec3d(0.0, -100.0, 0.0);
+
 
 
